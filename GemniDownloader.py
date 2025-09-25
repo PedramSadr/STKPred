@@ -133,24 +133,33 @@ if __name__ == '__main__':
     start_date = '2010-01-01'
     end_date = '2025-09-22'
 
-    # --- Step 2: Get the DataFrame ---
+    # --- Step 2: Get the main stock data with indicators ---
     df_with_indicators = get_stock_data_with_indicators(ticker, start_date, end_date)
 
-    # --- Step 3: Define the columns you want to save ---
-    macd_cols = [col for col in df_with_indicators.columns if col.startswith('MACD_')]
+    # --- Step 3: Get the market data (using the correct ticker for WTI) ---
+    # IMPORTANT: The ticker for WTI is 'CL=F', not 'WTI'
+    market_tickers = ['^VIX', 'DX-Y.NYB', 'SPY', 'CL=F']
+    market_data_df = get_market_close_prices(market_tickers, start_date, end_date)
+
+    # We also need to rename 'CL=F' to 'WTI' for the final output
+    market_data_df = market_data_df.rename(columns={'CL=F': 'WTI'})
+
+    # --- Step 4: MERGE FIRST to combine all data into one DataFrame ---
+    df_merged = pd.merge(df_with_indicators, market_data_df, on='Date', how='inner')
+
+    # --- Step 5: NOW define the columns you want and select them ---
+    macd_cols = [col for col in df_merged.columns if col.startswith('MACD_')]
 
     # This is the complete list of columns you want in your final file
-    # New line with 'Volume' added
-    output_cols = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'RSI', 'VWAP', 'SMA_25', 'SMA_50', 'SMA_100',
-                   'SMA_200'] + macd_cols
+    output_cols = [
+        'Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'RSI', 'VWAP',
+        'SMA_25', 'SMA_50', 'SMA_100', 'SMA_200', 'WTI', 'VIX', 'DXY', 'SPY'
+    ] + macd_cols
 
-    market_tickers = ['^VIX', 'DX-Y.NYB', 'SPY']  # Market tickers to fetch
-    market_data_df = get_market_close_prices(market_tickers, start_date, end_date)
-    # First, create a new DataFrame containing ONLY the columns you want to save.
-    df_to_save = df_with_indicators[output_cols]
-    df_to_save = pd.merge(df_with_indicators, market_data_df, on='Date', how='inner')
+    # Create the final DataFrame for saving by selecting columns from the MERGED data
+    df_to_save = df_merged[output_cols]
 
-    # Now, save this new DataFrame to your CSV file.
+    # --- Step 6: Save the final DataFrame to a CSV file ---
     output_path = r'C:\My Documents\Mics\Logs\tsla_daily.csv'
     df_to_save.to_csv(output_path, index=False)
 
