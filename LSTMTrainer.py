@@ -5,9 +5,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader, TensorDataset
 
-# The 'mean_squared_error' import is no longer needed
-# from sklearn.metrics import mean_squared_error
-
 # --- Step 1: Detect device, load and process data ---
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -18,9 +15,6 @@ df.columns = df.columns.str.strip().str.lower()
 
 # Drop any rows containing NaN values
 df = df.dropna()
-
-# The 'dates' variable is no longer needed for plotting predictions
-# dates = pd.to_datetime(df['date'])
 
 # Define the target variable (what we want to predict)
 prices = df['close'].values.astype(np.float32)
@@ -56,14 +50,12 @@ input_size = len(feature_cols)
 hidden_size = 60
 output_size = 1
 
-
 def create_sequences(features, prices, seq_length):
     xs, ys = [], []
     for i in range(len(features) - seq_length):
         xs.append(features[i:i + seq_length])
         ys.append(prices[i + seq_length])
     return np.array(xs), np.array(ys)
-
 
 X, y_normalized = create_sequences(features, normalized_prices, sequence_length)
 
@@ -74,7 +66,6 @@ y_tensor = torch.tensor(y_normalized).unsqueeze(1).to(device)
 # Create DataLoader
 dataset = TensorDataset(X_tensor, y_tensor)
 loader = DataLoader(dataset, batch_size=32, shuffle=True)
-
 
 # Define LSTM Model
 class LSTMNet(nn.Module):
@@ -87,7 +78,6 @@ class LSTMNet(nn.Module):
         out, _ = self.lstm(x)
         out = self.fc(out[:, -1, :])
         return out
-
 
 model = LSTMNet(input_size, hidden_size, output_size)
 model.to(device)
@@ -112,7 +102,13 @@ for epoch in range(epochs):
     epoch_losses.append(loss.item())
     print(f'Epoch {epoch + 1}, Loss: {loss.item():.4f}')
 
-# --- Step 3: Plot Training Loss vs. Epoch ---
+# --- Step 3: Save the trained model ---
+# <-- FIX: Added 'r' to create a raw string and fix the file path
+save_path = r'C:\My Documents\Mics\Logs\tsla_lstm_model.pth'
+torch.save(model.state_dict(), save_path)
+print(f"\nModel training complete. Saved to {save_path}")
+
+# --- Step 4: Plot Training Loss vs. Epoch ---
 plt.figure(figsize=(12, 6))
 plt.plot(range(1, epochs + 1), epoch_losses, label='Training Loss')
 plt.xlabel('Epoch')
@@ -121,5 +117,3 @@ plt.title('Training Loss vs. Epoch')
 plt.legend()
 plt.grid(True)
 plt.show()
-
-print("\nModel training complete.")
