@@ -69,7 +69,7 @@ sequence_length_range = (14, 50)
 learning_rate_range = (0.001, 0.1)
 epochs_range = (500, 550)
 batch_size_range = (32, 128)
-trials = 50
+trials = 80
 
 best_loss = float('inf')
 best_params = None
