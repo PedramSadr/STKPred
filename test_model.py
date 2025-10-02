@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 from sklearn.preprocessing import MinMaxScaler
 
 class LSTMModel(nn.Module):
-    def __init__(self, input_size=8, hidden_size=50, num_layers=6, output_size=1):
+    def __init__(self, input_size=16, hidden_size=52, num_layers=1, output_size=1):
         super(LSTMModel, self).__init__()
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
         self.fc = nn.Linear(hidden_size, output_size)
@@ -15,13 +15,15 @@ class LSTMModel(nn.Module):
         out = self.fc(out[:, -1, :])
         return out
 
-SEQ_LENGTH = 60
-MODEL_PATH = r'C:\My Documents\Mics\Logs\model.pth'
-CSV_PATH = r'C:\My Documents\Mics\Logs\tsla_daily.csv'
+SEQ_LENGTH = 32  # Use the same sequence_length as in best trial
+MODEL_PATH = r'C:\My Documents\Mics\Logs\tsla_lstm_model_best.pth'
+CSV_PATH = r'C:\My Documents\Mics\Logs\tsla_daily_test.csv'
 
 df = pd.read_csv(CSV_PATH)
-# Use the same 8 features as in training
-feature_cols = ['Year', 'Month', 'Day', 'Open', 'Hi', 'Low', 'Close', 'Volume']  # adjust as needed
+feature_cols = [
+    'Open', 'High', 'Low', 'Close', 'Volume', 'RSI', 'VWAP', 'SMA_25', 'SMA_50',
+    'SMA_100', 'SMA_200', 'WTI', 'VIX', 'DXY', 'SPY', 'MACD_12_26_9'
+]
 features = df[feature_cols].values
 scaler = MinMaxScaler()
 features_scaled = scaler.fit_transform(features)
@@ -30,14 +32,14 @@ def create_sequences(data, seq_length):
     xs, ys, idxs = [], [], []
     for i in range(len(data) - seq_length):
         xs.append(data[i:i+seq_length])
-        ys.append(data[i+seq_length][3])  # Assuming 'Close' is at index 3
+        ys.append(data[i+seq_length][3])  # 'Close' is at index 3 in feature_cols
         idxs.append(i + seq_length)
     return np.array(xs), np.array(ys), np.array(idxs)
 
 X, y, idxs = create_sequences(features_scaled, SEQ_LENGTH)
 
 device = torch.device('cpu')
-model = LSTMModel()
+model = LSTMModel(input_size=len(feature_cols), hidden_size=52, num_layers=1, output_size=1)
 model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
 model.eval()
 
@@ -51,7 +53,7 @@ close_scaler.fit(df[['Close']].values)
 preds_inv = close_scaler.inverse_transform(preds)
 y_inv = close_scaler.inverse_transform(y.reshape(-1, 1))
 
-df['Date'] = pd.to_datetime(df[['Year', 'Month', 'Day']])
+df['Date'] = pd.to_datetime(df['Date'])
 plot_dates = df['Date'].iloc[idxs].values
 
 plt.figure(figsize=(14, 6))
