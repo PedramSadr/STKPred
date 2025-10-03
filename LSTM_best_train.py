@@ -3,9 +3,17 @@ import torch.nn as nn
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import random
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.model_selection import train_test_split
 
+
+seed = 42
+torch.manual_seed(seed)
+np.random.seed(seed)
+random.seed(seed)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(seed)
 # Device setup
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -39,8 +47,12 @@ normalized_prices = (prices - price_mean) / price_std
 train_features, val_features, train_prices, val_prices = train_test_split(
     features, normalized_prices, test_size=0.2, shuffle=False)
 
-# Sequence creation
-sequence_length = 32
+# Hyperparameters
+hidden_size = 46
+sequence_length = 2
+epochs = 506
+batch_size = 79
+lr = 0.02665
 
 def create_sequences(features, prices, seq_length):
     xs, ys = [], []
@@ -59,8 +71,8 @@ y_val_tensor = torch.tensor(y_val).unsqueeze(1).to(device)
 
 train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
 val_dataset = TensorDataset(X_val_tensor, y_val_tensor)
-train_loader = DataLoader(train_dataset, batch_size=95, shuffle=True)
-val_loader = DataLoader(val_dataset, batch_size=95, shuffle=False)
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
 # Model definition
 class LSTMNet(nn.Module):
@@ -76,17 +88,15 @@ class LSTMNet(nn.Module):
         return out
 
 input_size = len(feature_cols)
-hidden_size = 52
 output_size = 1
 model = LSTMNet(input_size, hidden_size, output_size)
 model.to(device)
 
 criterion = nn.MSELoss()
-optimizer = torch.optim.AdamW(model.parameters(), lr=0.0005, weight_decay=0.0001)
+optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.0001)
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
 
 # Training loop
-epochs = 800
 patience = 20
 min_delta = 1e-5
 train_losses = []
@@ -146,4 +156,3 @@ plt.title('Best Hyperparameters Training')
 plt.legend()
 plt.grid(True)
 plt.show()
-
