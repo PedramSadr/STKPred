@@ -5,6 +5,11 @@ import torch
 import torch.nn as nn
 from sklearn.preprocessing import MinMaxScaler
 
+#
+# This Code Performs Monte Carlo Simulations to Predict TSLA Stock Prices
+# using both a NumPy-based Geometric Brownian Motion model and a trained LSTM model
+#
+
 # 1. Read CSV file and prepare data
 df = pd.read_csv(r'C:\My Documents\Mics\Logs\tsla_monte.csv')
 df['Date'] = pd.to_datetime(df['Date'])

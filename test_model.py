@@ -6,6 +6,12 @@ import matplotlib.pyplot as plt
 from sklearn.preprocessing import MinMaxScaler
 import matplotlib.dates as mdates
 
+
+#
+# This Code Loads a Pretrained LSTM Model to Predict TSLA Stock Prices
+# and Plots the Actual vs Predicted Close Prices
+#
+
 # --- Model Definition ---
 class LSTMModel(nn.Module):
     def __init__(self, input_size=16, hidden_size=81, num_layers=1, output_size=1):

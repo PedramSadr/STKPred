@@ -7,6 +7,10 @@ from torch.utils.data import DataLoader, TensorDataset
 from sklearn.model_selection import train_test_split
 import random
 
+#
+#This Code Performs Hyperparameter Optimization for a Bidirectional LSTM Model on TSLA Stock Data
+#This code trians multiple BiLSTM models with different hyperparameters to find the best configuration(With the lowest validation loss & Trail = 3000)
+#
 # --- Step 1: Detect device, load and process data ---
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
