@@ -1,0 +1,46 @@
+
+
+# Data Aggregation Process
+
+This document outlines the steps to download and consolidate financial data using the provided scripts.
+
+## Instructions
+
+Follow these steps in order to ensure the data is processed correctly.
+
+### 1\. Download Data
+
+First, you need to run the `AlphaVantageDownloader` script to fetch the required data.
+
+  * Open the `AlphaVantageDownloader` script.
+  * Locate the `main` function.
+  * Set the parameters as follows to define the date range for the data download:
+    ```python
+    example_from = '2020-01-01'
+    example_to = '2020-12-31'
+    ```
+  * Execute the script.
+
+-----
+
+### 2\. Verify File Location
+
+Once the downloader has finished, the data files will be saved to your local machine.
+
+  * Navigate to the following directory:
+    ```
+    C:\My Documents\Mics\Logs\AlphaVantage\
+    ```
+  * Confirm that the new data files are present in this folder.
+
+-----
+
+### 3\. Append Files
+
+Finally, run the `FileAppender` script to combine all the downloaded files into a single, consolidated file.
+
+  * Execute the `FileAppender` script.
+  * The script will automatically:
+    1.  Look for all files in `C:\My Documents\Mics\Logs\AlphaVantage\`.
+    2.  Sort the located files in alphabetical order.
+    3.  Append the content of each file into one final output file.
