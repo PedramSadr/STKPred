@@ -1,4 +1,3 @@
-# python
 import torch
 import torch.nn as nn
 import pandas as pd
@@ -14,7 +13,7 @@ import math
 
 # --- MODEL DEFINITION ---
 class BiLSTMNet(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size, num_layers=2, dropout=0.2):
+    def __init__(self, input_size, hidden_size, output_size, num_layers=2, dropout=0.1):
         super(BiLSTMNet, self).__init__()
         self.hidden_size = hidden_size
         self.num_layers = num_layers
@@ -22,15 +21,23 @@ class BiLSTMNet(nn.Module):
                             batch_first=True,
                             dropout=dropout,
                             bidirectional=True)
-        self.fc = nn.Linear(hidden_size * 2, output_size)
+        self.layer_norm = nn.LayerNorm(hidden_size * 2)
+        self.head = nn.Sequential(
+            nn.Linear(hidden_size * 2, max(8, hidden_size // 2)),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(max(8, hidden_size // 2), output_size)
+        )
 
     def forward(self, x):
-        h0 = torch.zeros(self.num_layers * 2, x.size(0), self.hidden_size).to(x.device)
-        c0 = torch.zeros(self.num_layers * 2, x.size(0), self.hidden_size).to(x.device)
+        batch = x.size(0)
+        h0 = torch.zeros(self.num_layers * 2, batch, self.hidden_size, device=x.device)
+        c0 = torch.zeros(self.num_layers * 2, batch, self.hidden_size, device=x.device)
         out, _ = self.lstm(x, (h0, c0))
-        out = self.fc(out[:, -1, :])
+        last = out[:, -1, :]
+        last = self.layer_norm(last)
+        out = self.head(last)
         return out
-
 # --- END MODEL DEFINITION ---
 
 # Default number of workers: 0 is safe for memory constrained environments (Windows)
@@ -39,11 +46,11 @@ DEFAULT_NUM_WORKERS = 0
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
-# Default paths (can be overridden by CLI args)
-CSV_PATH = r'C:\My Documents\Mics\Logs\TSLA_Options_Chain_Historical_combined.csv'
-OUTPUT_MODEL_PATH = r'C:\My Documents\Mics\Logs\tsla_bilstm_option_model_best.pth'
-FINAL_MODEL_PATH = r'C:\My Documents\Mics\Logs\tsla_option_bilstm_model_final.pth'
-SCALER_PATH = r'C:\My Documents\Mics\Logs\tsla_option_scaler_stats.npz'
+# python
+CSV_PATH = r"C:\My Documents\Mics\Logs\TSLA_Options_Chain_Historical_combined.csv"
+OUTPUT_MODEL_PATH = r"C:\My Documents\Mics\Logs\tsla_bilstm_option_model_best.pth"
+FINAL_MODEL_PATH = r"C:\My Documents\Mics\Logs\tsla_option_bilstm_model_final.pth"
+SCALER_PATH = r"C:\My Documents\Mics\Logs\tsla_option_scaler_stats.npz"
 
 # CLI arguments
 parser = argparse.ArgumentParser(description='Train BiLSTM on options chain data')
@@ -167,6 +174,38 @@ features = features_df.values.astype(np.float32)
 if len(prices) != len(features):
     raise RuntimeError("Length mismatch between features and prices after preprocessing")
 
+# ===== Reproducibility, lag feature and weight init (inserted here before splits) =====
+seed = 42
+random.seed(seed)
+np.random.seed(seed)
+torch.manual_seed(seed)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(seed)
+
+# add simple lag-1 price feature and update features array
+lag1 = np.concatenate(([0.0], prices[:-1])).astype(np.float32).reshape(-1, 1)
+features = np.hstack([features, lag1])
+
+# update input_size to reflect new features (used by estimate and models)
+input_size = features.shape[1]
+output_size = 1
+
+# weight initialization helper
+def init_weights(module):
+    if isinstance(module, nn.Linear):
+        nn.init.kaiming_normal_(module.weight, nonlinearity='relu')
+        if module.bias is not None:
+            nn.init.constant_(module.bias, 0.0)
+    elif isinstance(module, nn.LSTM):
+        for name, param in module.named_parameters():
+            if 'weight_ih' in name:
+                nn.init.xavier_uniform_(param.data)
+            elif 'weight_hh' in name:
+                nn.init.orthogonal_(param.data)
+            elif 'bias' in name:
+                nn.init.constant_(param.data, 0.0)
+# ===== end insertion =====
+
 # Train/validation split (chronological)
 train_features_raw, val_features_raw, train_prices, val_prices = train_test_split(
     features, prices, test_size=0.2, shuffle=False)
@@ -182,9 +221,6 @@ train_features = (train_features_raw - feat_mean) / feat_std
 val_features = (val_features_raw - feat_mean) / feat_std
 train_prices_norm = (train_prices - price_mean) / price_std
 val_prices_norm = (val_prices - price_mean) / price_std
-
-input_size = train_features.shape[1]
-output_size = 1
 
 # Convert to torch tensors on CPU (do not move to GPU until batches)
 train_features = torch.from_numpy(train_features).float()
@@ -221,7 +257,7 @@ hidden_size_range = (16, 32)
 sequence_length_range = (5, 20)
 learning_rate_range = (0.001, 0.01)
 epochs_range = (3, 6)
-trials = 3
+trials = 30
 batch_size_range = (32, 512)
 
 # Override ranges with CLI args if provided
@@ -335,10 +371,12 @@ for trial in range(trials):
     train_loader = DataLoader(train_dataset, **dl_train_kwargs)
     val_loader = DataLoader(val_dataset, **dl_val_kwargs)
 
+    # model, criterion, optimizer, scheduler (improved)
     model = BiLSTMNet(input_size, hidden_size, output_size).to(device)
-    criterion = nn.MSELoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=5)
+    model.apply(init_weights)
+    criterion = nn.SmoothL1Loss()  # Huber-like
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs))
     scaler = torch.cuda.amp.GradScaler() if USE_AMP else None
 
     best_val_loss = float('inf')
@@ -394,7 +432,13 @@ for trial in range(trials):
                 val_samples += xb.size(0)
 
         avg_val_loss = epoch_val_loss / val_samples if val_samples else float('nan')
-        scheduler.step(avg_val_loss)
+
+        # Cosine scheduler: step once per epoch
+        try:
+            scheduler.step()
+        except Exception:
+            # fallback: if scheduler expects metric, ignore
+            pass
 
         if epoch % 10 == 0 or epoch == epochs - 1:
             print(f"Epoch {epoch + 1}/{epochs}, Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}")
