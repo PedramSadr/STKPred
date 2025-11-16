@@ -46,6 +46,43 @@ DEFAULT_NUM_WORKERS = 0
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
+# Diagnostic block: print PyTorch / CUDA / cuDNN / GPU memory info
+try:
+    import torch.backends.cudnn as cudnn
+    import subprocess555
+    print("Torch version:", torch.__version__)
+    print("Torch compiled CUDA:", torch.version.cuda)
+    print("CUDA available (torch):", torch.cuda.is_available())
+    if torch.cuda.is_available():
+        try:
+            print("CUDA devices:", torch.cuda.device_count())
+            for i in range(torch.cuda.device_count()):
+                try:
+                    print(f" - Device {i}:", torch.cuda.get_device_name(i))
+                except Exception as e:
+                    print(f"   Could not get device name for device {i}: {e}")
+        except Exception as e:
+            print("Error enumerating CUDA devices:", e)
+        try:
+            print("cuDNN version:", cudnn.version())
+        except Exception as e:
+            print("cuDNN check failed:", e)
+        try:
+            print("CUDA memory allocated (MB):", torch.cuda.memory_allocated() / 1024**2)
+            print("CUDA memory reserved  (MB):", torch.cuda.memory_reserved() / 1024**2)
+        except Exception as e:
+            print("CUDA memory query failed:", e)
+    else:
+        print("Running on CPU (CUDA not available to torch)")
+    # Try to call nvidia-smi to show driver-level info
+    try:
+        out = subprocess.check_output(["nvidia-smi"], universal_newlines=True)
+        print("\n-- nvidia-smi output --\n", out)
+    except Exception as e:
+        print("nvidia-smi call failed (not found or error):", e)
+except Exception as e:
+    print("CUDA diagnostic block failed:", e)
+
 # python
 CSV_PATH = r"C:\My Documents\Mics\Logs\TSLA_Options_Chain_Historical_combined.csv"
 OUTPUT_MODEL_PATH = r"C:\My Documents\Mics\Logs\tsla_bilstm_option_model_best.pth"
@@ -257,7 +294,7 @@ hidden_size_range = (16, 32)
 sequence_length_range = (5, 20)
 learning_rate_range = (0.001, 0.01)
 epochs_range = (3, 6)
-trials = 30
+trials = 1000
 batch_size_range = (32, 512)
 
 # Override ranges with CLI args if provided
@@ -441,7 +478,9 @@ for trial in range(trials):
             pass
 
         if epoch % 10 == 0 or epoch == epochs - 1:
-            print(f"Epoch {epoch + 1}/{epochs}, Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}")
+            train_loss_str = f"{avg_train_loss:.6f}" if (isinstance(avg_train_loss, float) and not math.isnan(avg_train_loss)) else str(avg_train_loss)
+            val_loss_str = f"{avg_val_loss:.6f}" if (isinstance(avg_val_loss, float) and not math.isnan(avg_val_loss)) else str(avg_val_loss)
+            print(f"Epoch {epoch + 1}/{epochs}, Train Loss: {train_loss_str}, Val Loss: {val_loss_str}")
 
         if avg_val_loss < best_val_loss - min_delta:
             best_val_loss = avg_val_loss
@@ -453,7 +492,8 @@ for trial in range(trials):
             print(f"Early stopping at epoch {epoch + 1}")
             break
 
-    print(f"Best validation loss for this trial: {best_val_loss:.6f}")
+    best_val_str = f"{best_val_loss:.6f}" if (best_val_loss is not None and isinstance(best_val_loss, float) and not math.isnan(best_val_loss)) else str(best_val_loss)
+    print(f"Best validation loss for this trial: {best_val_str}")
     if best_val_loss < best_loss:
         best_loss = best_val_loss
         best_params = {
@@ -480,6 +520,8 @@ if best_params is None:
     raise RuntimeError("No model was trained successfully")
 
 print(f"Loading best model from {OUTPUT_MODEL_PATH} for final save and plot.")
+# Guard to satisfy static checks and avoid None
+assert best_params is not None, "best_params is None at final save"
 hidden_size_final = int(best_params['hidden_size'])
 final_model = BiLSTMNet(input_size, hidden_size_final, output_size)
 final_model.load_state_dict(torch.load(OUTPUT_MODEL_PATH, map_location='cpu'))
@@ -491,6 +533,8 @@ best_model = final_model
 best_model.to(device)
 best_model.eval()
 
+# Guard for seq length
+assert best_params is not None
 best_seq_length = int(best_params['sequence_length'])
 val_plot_dataset = SequenceDataset(val_features, val_prices_norm, best_seq_length)
 if len(val_plot_dataset) == 0:
