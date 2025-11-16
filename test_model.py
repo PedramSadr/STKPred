@@ -6,9 +6,15 @@ import matplotlib.pyplot as plt
 from sklearn.preprocessing import MinMaxScaler
 import matplotlib.dates as mdates
 
+
+#
+# This Code Loads a Pretrained LSTM Model to Predict TSLA Stock Prices
+# and Plots the Actual vs Predicted Close Prices
+#
+
 # --- Model Definition ---
 class LSTMModel(nn.Module):
-    def __init__(self, input_size=16, hidden_size=46, num_layers=1, output_size=1):
+    def __init__(self, input_size=16, hidden_size=81, num_layers=1, output_size=1):
         super().__init__()
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
         self.fc = nn.Linear(hidden_size, output_size)
@@ -18,8 +24,8 @@ class LSTMModel(nn.Module):
         return out
 
 # --- Config ---
-SEQ_LENGTH = 2
-MODEL_PATH = r'C:\My Documents\Mics\Logs\tsla_lstm_model_best.pth'
+SEQ_LENGTH = 7
+MODEL_PATH = r'C:\My Documents\Mics\Logs\tsla_lstm_model_final.pth'
 CSV_PATH = r'C:\My Documents\Mics\Logs\tsla_daily_test.csv'
 
 # --- Data Loading ---
@@ -45,7 +51,7 @@ X, y, idxs = create_sequences(features_scaled, SEQ_LENGTH)
 
 # --- Model Loading ---
 device = torch.device('cpu')
-model = LSTMModel(input_size=len(feature_cols), hidden_size=46, num_layers=1, output_size=1)
+model = LSTMModel(input_size=len(feature_cols), hidden_size=81, num_layers=1, output_size=1)
 model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
 model.eval()
 
@@ -57,8 +63,6 @@ with torch.no_grad():
         X_tensor = X_tensor.unsqueeze(0)
     elif X_tensor.ndim == 1:
         X_tensor = X_tensor.unsqueeze(0).unsqueeze(0)
-    preds = model(X_tensor).numpy()
-
     preds = model(X_tensor).numpy()
 
 # --- Inverse Transform ---

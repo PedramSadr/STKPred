@@ -7,6 +7,9 @@ import random
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.model_selection import train_test_split
 
+#
+#This Code Trains an LSTM Model on TSLA Stock Data with Predefined Hyperparameters
+#
 
 seed = 42
 torch.manual_seed(seed)
