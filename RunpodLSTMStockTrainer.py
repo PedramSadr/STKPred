@@ -24,7 +24,7 @@ if device.type == "cuda":
     torch.backends.cudnn.benchmark = True
 
 # Load data and convert all column names to lowercase for consistency
-df = pd.read_csv(r'/workspace/data/tsla_daily.csv')
+df = pd.read_csv(r'/workspace/lstm-project/data/tsla_daily.csv')
 df.columns = df.columns.str.strip().str.lower()
 df = df.dropna()
 
@@ -112,10 +112,11 @@ for trial in range(trials):
         print("Skipping trial, validation set is too small for this sequence length.")
         continue
 
-    X_train_tensor = torch.tensor(X_train, dtype=torch.float32).to(device)
-    y_train_tensor = torch.tensor(y_train, dtype=torch.float32).unsqueeze(1).to(device)
-    X_val_tensor = torch.tensor(X_val, dtype=torch.float32).to(device)
-    y_val_tensor = torch.tensor(y_val, dtype=torch.float32).unsqueeze(1).to(device)
+    # Create tensors on CPU so DataLoader can use pin_memory (only CPU tensors can be pinned)
+    X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
+    y_train_tensor = torch.tensor(y_train, dtype=torch.float32).unsqueeze(1)
+    X_val_tensor = torch.tensor(X_val, dtype=torch.float32)
+    y_val_tensor = torch.tensor(y_val, dtype=torch.float32).unsqueeze(1)
 
     # DataLoader improvements for CUDA
     pin_memory = True if device.type == "cuda" else False
@@ -127,8 +128,31 @@ for trial in range(trials):
     # Create model and enable multi-GPU with DataParallel if available
     model = BiLSTMNet(input_size, hidden_size, output_size).to(device)
     if multi_gpu:
-        model = nn.DataParallel(model)
-        print("Wrapped model with nn.DataParallel")
+        try:
+            model = nn.DataParallel(model)
+            print("Wrapped model with nn.DataParallel")
+            # Quick sanity check: run a tiny forward to detect Scatter/Gather/ECC issues early
+            seq_test_len = max(1, min(5, sequence_length))
+            try:
+                with torch.no_grad():
+                    test_input = torch.zeros((1, seq_test_len, input_size), dtype=torch.float32).to(device)
+                    _ = model(test_input)
+            except Exception as e:
+                print("DataParallel quick-forward test failed, unwrapping to single-GPU. Error:\n", e)
+                # unwrap to single GPU
+                state = model.module.state_dict() if hasattr(model, 'module') else None
+                multi_gpu = False
+                model = BiLSTMNet(input_size, hidden_size, output_size).to(device)
+                if state is not None:
+                    try:
+                        model.load_state_dict(state)
+                    except Exception:
+                        # state likely not compatible at this stage; continue with fresh model
+                        pass
+        except Exception as e:
+            print("Failed to wrap model with DataParallel, falling back to single GPU. Error:\n", e)
+            multi_gpu = False
+            model = BiLSTMNet(input_size, hidden_size, output_size).to(device)
 
     criterion = nn.MSELoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
@@ -142,9 +166,30 @@ for trial in range(trials):
         model.train()
         epoch_train_loss = 0.0
         for xb, yb in train_loader:
+            # Move each batch to the device here (supports pin_memory optimizations)
             xb = xb.to(device)
             yb = yb.to(device)
-            pred = model(xb)
+            try:
+                pred = model(xb)
+            except Exception as e:
+                # Detect CUDA/DataParallel related errors (e.g., ECC issues) and fallback to single-GPU
+                msg = str(e)
+                if multi_gpu and ("CUDA" in msg or "cuda" in msg or "ECC" in msg or isinstance(e, RuntimeError)):
+                    print("CUDA/DataParallel error detected during forward; falling back to single-GPU. Error:\n", e)
+                    # Extract underlying state dict (if model was DataParallel)
+                    state = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
+                    # Disable multi-GPU and recreate model on single device
+                    multi_gpu = False
+                    model = BiLSTMNet(input_size, hidden_size, output_size).to(device)
+                    model.load_state_dict(state)
+                    # Recreate optimizer/scheduler bound to new model parameters
+                    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+                    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=10)
+                    print("Model unwrapped to single-GPU and optimizer/scheduler recreated. Continuing training.")
+                    pred = model(xb)
+                else:
+                    raise
+
             loss = criterion(pred, yb)
             optimizer.zero_grad()
             loss.backward()
@@ -158,17 +203,44 @@ for trial in range(trials):
             for xb, yb in val_loader:
                 xb = xb.to(device)
                 yb = yb.to(device)
-                pred = model(xb)
+                try:
+                    pred = model(xb)
+                except Exception as e:
+                    msg = str(e)
+                    if multi_gpu and ("CUDA" in msg or "cuda" in msg or "ECC" in msg or isinstance(e, RuntimeError)):
+                        print("CUDA/DataParallel error detected during validation forward; falling back to single-GPU. Error:\n", e)
+                        state = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
+                        multi_gpu = False
+                        model = BiLSTMNet(input_size, hidden_size, output_size).to(device)
+                        model.load_state_dict(state)
+                        optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+                        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=10)
+                        print("Model unwrapped to single-GPU for validation.")
+                        pred = model(xb)
+                    else:
+                        raise
+
                 epoch_val_loss += criterion(pred, yb).item()
 
-        avg_train_loss = epoch_train_loss / len(train_loader)
-        avg_val_loss = epoch_val_loss / len(val_loader)
-        scheduler.step(avg_val_loss)
+        # Safeguard: avoid division by zero if train_loader/val_loader empty
+        if len(train_loader) == 0:
+            avg_train_loss = float('nan')
+        else:
+            avg_train_loss = epoch_train_loss / len(train_loader)
+
+        if len(val_loader) == 0:
+            avg_val_loss = float('nan')
+        else:
+            avg_val_loss = epoch_val_loss / len(val_loader)
+
+        # Step scheduler only when we have a numeric val loss
+        if not np.isnan(avg_val_loss):
+            scheduler.step(avg_val_loss)
 
         if epoch % 10 == 0:
             print(f"Epoch {epoch+1}, Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}")
 
-        if avg_val_loss < best_val_loss - min_delta:
+        if not np.isnan(avg_val_loss) and avg_val_loss < best_val_loss - min_delta:
             best_val_loss = avg_val_loss
             epochs_no_improve = 0
             # store state_dict of underlying model (unwrap DataParallel)
@@ -178,16 +250,19 @@ for trial in range(trials):
                 best_model_state_for_trial = model.state_dict()
         else:
             epochs_no_improve += 1
+
         if epochs_no_improve >= patience:
             print(f"Early stopping at epoch {epoch+1}")
             break
 
     print(f"Best validation loss for this trial: {best_val_loss:.6f}")
+    # record how many epochs were actually run in this trial
+    epochs_run = epoch + 1
     if best_val_loss < best_loss and best_model_state_for_trial is not None:
         best_loss = best_val_loss
         best_params = {
             'hidden_size': hidden_size, 'sequence_length': sequence_length,
-            'learning_rate': learning_rate, 'epochs_run': epoch+1, 'batch_size': batch_size
+            'learning_rate': learning_rate, 'epochs_run': epochs_run, 'batch_size': batch_size
         }
         # Save the unwrapped state dict
         os.makedirs(os.path.dirname(best_model_path), exist_ok=True)
