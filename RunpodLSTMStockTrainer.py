@@ -11,7 +11,7 @@ import optuna
 # ---------------------------------------------------------
 # Environment / device setup (one process per GPU)
 #This Code Sets Up the Environment for Multi-GPU Training Using PyTorch and Optuna
-On Runpods.io
+#On Runpods.io
 #To run this code on Runpods.io use the following command:
 #torchrun --standalone --nnodes=1 --nproc_per_node=4 RunpodLSTMStockTrainer.py
 # Each process will automatically get its own LOCAL_RANK and GLOBAL_RANK

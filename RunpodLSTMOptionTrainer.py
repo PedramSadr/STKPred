@@ -12,8 +12,8 @@ import optuna
 
 # ---------------------------------------------------------
 # Environment / device setup (one process per GPU)
-# To run on Runpod (4 GPUs), for example:
-#   torchrun --standalone --nnodes=1 --nproc_per_node=4 RunpodLSTMStockTrainer.py
+# To run on Runpod (e.g., 4 GPUs):
+#   torchrun --standalone --nnodes=1 --nproc_per_node=4 RunpodLSTMOptionTrainer.py
 # ---------------------------------------------------------
 LOCAL_RANK = int(os.environ.get("LOCAL_RANK", "0"))
 GLOBAL_RANK = int(os.environ.get("RANK", "0"))
@@ -96,15 +96,17 @@ df = df.sort_values(["date", "expiration", "strike"]).reset_index(drop=True)
 # Target: we predict future strike
 prices = df["strike"].values.astype(np.float32)
 
-# Build feature set from your listed columns (numeric transformations)
-# Original columns you gave:
+# ---------------------------------------------------------
+# Feature selection
+# You said the CSV columns are:
 # contractid, expiration, strike, type, last, mark, bid, bid_size, ask, ask_size,
 # volume, open_interest, date, implied_volatility, delta, gamma, theta, vega, rho,
 # rsi, vwap, sma_25, sma_50, sma_100, sma_200
 #
-# We will use numeric versions of these plus days_to_expiration and type_encoded.
+# We drop non-numeric IDs / raw text, and keep numeric versions.
+# ---------------------------------------------------------
 numeric_feature_cols = [
-    # we skip 'contractid' (ID) and raw date/expiration/type strings
+    # NOTE: we deliberately SKIP 'contractid', 'date', 'expiration', and raw 'type'
     "strike",
     "last",
     "mark",
@@ -141,8 +143,12 @@ if len(feature_cols) == 0:
 
 features_df = df[feature_cols].copy()
 
+# ---- FIX: force all feature columns to numeric to avoid string values ----
+for col in features_df.columns:
+    features_df[col] = pd.to_numeric(features_df[col], errors="coerce")
+
 # Drop zero-variance features (constant columns)
-stds = features_df.std()
+stds = features_df.std()  # now safe: all columns are numeric (or NaN)
 zero_std_cols = stds[stds < 1e-6].index
 if not zero_std_cols.empty and GLOBAL_RANK == 0:
     print(f"Warning: Removing zero-variance features: {list(zero_std_cols)}")
@@ -393,7 +399,6 @@ if __name__ == "__main__":
         final_model = BiLSTMNet(input_size, best_trial.params["hidden_size"], output_size)
         final_model.load_state_dict(best_state_dict)
 
-        # ---- THIS IS THE LINE WITH THE MODEL FILE NAME ----
         date_str = datetime.now().strftime("%Y%m%d")
         model_filename = f"bilstm_option_{date_str}.pth"
         final_path = os.path.join(OUTPUT_DIR, model_filename)
