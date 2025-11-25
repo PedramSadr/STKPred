@@ -1,5 +1,7 @@
 import os
 import math
+from datetime import datetime
+
 import torch
 import torch.nn as nn
 import pandas as pd
@@ -10,13 +12,8 @@ import optuna
 
 # ---------------------------------------------------------
 # Environment / device setup (one process per GPU)
-# This Code Sets Up the Environment for Multi-GPU Training Using PyTorch and Optuna For option price prediction.
-#One can change the PREDICTION_HORIZON_DAYS = 10  to
-# On Runpods.io
-# To run this code on Runpods.io use the following command:
-# torchrun --standalone --nnodes=1 --nproc_per_node=4 RunpodLSTMStockTrainer.py
-# Each process will automatically get its own LOCAL_RANK and GLOBAL_RANK
-# 4 indicates number of GPUs to use
+# To run on Runpod (4 GPUs), for example:
+#   torchrun --standalone --nnodes=1 --nproc_per_node=4 RunpodLSTMStockTrainer.py
 # ---------------------------------------------------------
 LOCAL_RANK = int(os.environ.get("LOCAL_RANK", "0"))
 GLOBAL_RANK = int(os.environ.get("RANK", "0"))
@@ -30,14 +27,16 @@ else:
 # ---------------------------------------------------------
 # Paths & constants
 # ---------------------------------------------------------
-DATA_PATH = "/workspace/lstm-project/data/TSLA_Options_Chain_With_Indicators.csv"  # <-- change to your options CSV
+DATA_PATH = "/workspace/lstm-project/data/TSLA_Options_Chain_With_Indicators.csv"
+
 BASE_DIR = "/workspace/lstm-project"
 DB_PATH = os.path.join(BASE_DIR, "optuna_study.db")
 CHECKPOINT_DIR = os.path.join(BASE_DIR, "optuna_checkpoints")
 OUTPUT_DIR = "/workspace/output"
+
 STUDY_NAME = "lstm_hyperparameter_study"
-TOTAL_TRIALS = 50  # approximate global budget
-PREDICTION_HORIZON_DAYS = 10  # ~2 trading weeks
+TOTAL_TRIALS = 50  # approximate global budget across all ranks
+PREDICTION_HORIZON = 14  # predict strike 14 steps (~2 weeks) ahead
 
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -55,39 +54,94 @@ except Exception as e:
 
 # Normalize column names
 df.columns = df.columns.str.strip().str.lower()
-df = df.dropna()
 
-# Target column: use STRIKE
-TARGET_COL = "strike"
-if TARGET_COL not in df.columns:
+# Basic sanity check: we need 'strike' as target
+if "strike" not in df.columns:
     if GLOBAL_RANK == 0:
-        raise SystemExit(
-            f"Input CSV must contain a '{TARGET_COL}' column (case-insensitive)."
-        )
+        raise SystemExit("Input CSV must contain a 'strike' column (case-insensitive).")
     else:
         raise SystemExit()
 
-prices = df[TARGET_COL].values.astype(np.float32)
+# Parse dates to build useful numeric features
+if "date" not in df.columns or "expiration" not in df.columns:
+    if GLOBAL_RANK == 0:
+        raise SystemExit("CSV must contain 'date' and 'expiration' columns.")
+    else:
+        raise SystemExit()
 
-# Feature columns (options features + technicals)
-feature_cols = [
-    "contractid", "expiration", "strike", "type",
-    "last", "mark", "bid", "bid_size", "ask", "ask_size",
-    "volume", "open_interest", "date",
-    "implied_volatility", "delta", "gamma", "theta", "vega", "rho",
-    "rsi", "vwap", "sma_25", "sma_50", "sma_100", "sma_200",
+df["date"] = pd.to_datetime(df["date"])
+df["expiration"] = pd.to_datetime(df["expiration"])
+
+# Days to expiration as a numeric feature
+df["days_to_expiration"] = (df["expiration"] - df["date"]).dt.days.astype(np.float32)
+
+# Encode option type (call/put) into a numeric feature
+# Adjust mapping if your 'type' values differ (e.g. 'C'/'P', 'CALL'/'PUT', etc.)
+if "type" in df.columns:
+    type_map = {
+        "C": 1.0,
+        "CALL": 1.0,
+        "P": 0.0,
+        "PUT": 0.0,
+    }
+    df["type_encoded"] = (
+        df["type"].astype(str).str.upper().map(type_map).fillna(0.0).astype(np.float32)
+    )
+else:
+    df["type_encoded"] = 0.0  # fallback if missing
+
+# Sort by date (and expiration as a secondary key) to define a time order
+df = df.sort_values(["date", "expiration", "strike"]).reset_index(drop=True)
+
+# Target: we predict future strike
+prices = df["strike"].values.astype(np.float32)
+
+# Build feature set from your listed columns (numeric transformations)
+# Original columns you gave:
+# contractid, expiration, strike, type, last, mark, bid, bid_size, ask, ask_size,
+# volume, open_interest, date, implied_volatility, delta, gamma, theta, vega, rho,
+# rsi, vwap, sma_25, sma_50, sma_100, sma_200
+#
+# We will use numeric versions of these plus days_to_expiration and type_encoded.
+numeric_feature_cols = [
+    # we skip 'contractid' (ID) and raw date/expiration/type strings
+    "strike",
+    "last",
+    "mark",
+    "bid",
+    "bid_size",
+    "ask",
+    "ask_size",
+    "volume",
+    "open_interest",
+    "implied_volatility",
+    "delta",
+    "gamma",
+    "theta",
+    "vega",
+    "rho",
+    "rsi",
+    "vwap",
+    "sma_25",
+    "sma_50",
+    "sma_100",
+    "sma_200",
+    "days_to_expiration",
+    "type_encoded",
 ]
-feature_cols = [c for c in feature_cols if c in df.columns]
+
+# Keep only those that are actually in the dataframe
+feature_cols = [c for c in numeric_feature_cols if c in df.columns]
 
 if len(feature_cols) == 0:
     if GLOBAL_RANK == 0:
-        raise SystemExit("No recognized feature columns found in CSV.")
+        raise SystemExit("No recognized numeric feature columns found in CSV.")
     else:
         raise SystemExit()
 
 features_df = df[feature_cols].copy()
 
-# Drop zero-variance features
+# Drop zero-variance features (constant columns)
 stds = features_df.std()
 zero_std_cols = stds[stds < 1e-6].index
 if not zero_std_cols.empty and GLOBAL_RANK == 0:
@@ -98,13 +152,14 @@ if not zero_std_cols.empty:
 
 features = features_df.values.astype(np.float32)
 input_size = len(feature_cols)
-output_size = 1
+output_size = 1  # predict a single value (future strike)
 
-# Train/val split (no leakage)
+# Train/validation split (no leakage)
 train_features, val_features, train_prices, val_prices = train_test_split(
     features, prices, test_size=0.2, shuffle=False
 )
 
+# Normalization based on training slice only
 train_feature_mean = train_features.mean(axis=0)
 train_feature_std = train_features.std(axis=0) + 1e-9
 train_price_mean = train_prices.mean()
@@ -117,31 +172,26 @@ normalized_train_prices = (train_prices - train_price_mean) / train_price_std
 normalized_val_prices = (val_prices - train_price_mean) / train_price_std
 
 # ---------------------------------------------------------
-# Sequence creation
+# Sequence creation (fixed prediction horizon)
 # ---------------------------------------------------------
-def create_sequences(features, targets, seq_length, horizon):
+def create_sequences(features, prices, seq_length, horizon=PREDICTION_HORIZON):
     """
-    Build sequences of length `seq_length` and use the target value
-    `horizon` steps after the last element in the sequence.
+    Build sequences of length `seq_length` and targets `horizon` steps ahead.
 
-    Example:
-      seq_length = 30, horizon = 10
-      sequence covers indices [i .. i+29]
-      label is targets[i+29+10]
+    X[t]  = features[t : t+seq_length]
+    y[t]  = prices[t + seq_length + horizon - 1]
     """
     xs, ys = [], []
-    if len(features) <= seq_length + horizon:
+    max_start = len(features) - seq_length - horizon + 1
+    if max_start <= 0:
         return np.array([]), np.array([])
-
-    last_start = len(features) - seq_length - horizon + 1
-    for i in range(last_start):
+    for i in range(max_start):
         xs.append(features[i : i + seq_length])
-        ys.append(targets[i + seq_length - 1 + horizon])
-
+        ys.append(prices[i + seq_length + horizon - 1])
     return np.array(xs), np.array(ys)
 
 # ---------------------------------------------------------
-# Model definition
+# Model
 # ---------------------------------------------------------
 class BiLSTMNet(nn.Module):
     def __init__(self, input_size, hidden_size, output_size):
@@ -181,38 +231,41 @@ def train_model(
 
     for epoch in range(epochs):
         model.train()
-        epoch_train_loss = 0.0
+        train_loss_sum = 0.0
+
         for xb, yb in train_loader:
             xb = xb.to(device)
             yb = yb.to(device)
 
             pred = model(xb)
             loss = criterion(pred, yb)
+
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            epoch_train_loss += loss.item()
+
+            train_loss_sum += loss.item()
 
         model.eval()
-        epoch_val_loss = 0.0
+        val_loss_sum = 0.0
         with torch.no_grad():
             for xb, yb in val_loader:
                 xb = xb.to(device)
                 yb = yb.to(device)
                 pred = model(xb)
-                epoch_val_loss += criterion(pred, yb).item()
+                val_loss_sum += criterion(pred, yb).item()
 
-        avg_train_loss = epoch_train_loss / max(len(train_loader), 1)
-        avg_val_loss = epoch_val_loss / max(len(val_loader), 1)
+        avg_train_loss = train_loss_sum / max(len(train_loader), 1)
+        avg_val_loss = val_loss_sum / max(len(val_loader), 1)
 
-        # Scheduler step
+        # Scheduler on validation loss
         try:
             scheduler.step(avg_val_loss)
         except Exception:
             pass
 
-        # Optuna pruning (only main rank logs)
+        # Optuna pruning (only on rank 0 to avoid conflicts)
         if trial is not None and GLOBAL_RANK == 0:
             trial.report(avg_val_loss, epoch)
             if trial.should_prune():
@@ -245,10 +298,10 @@ def objective(trial: optuna.trial.Trial):
     batch_size = trial.suggest_categorical("batch_size", [32, 48, 64, 96, 128])
 
     X_train, y_train = create_sequences(
-        train_features, normalized_train_prices, sequence_length, PREDICTION_HORIZON_DAYS
+        train_features, normalized_train_prices, sequence_length
     )
     X_val, y_val = create_sequences(
-        val_features, normalized_val_prices, sequence_length, PREDICTION_HORIZON_DAYS
+        val_features, normalized_val_prices, sequence_length
     )
 
     if len(X_train) == 0 or len(X_val) == 0:
@@ -272,12 +325,12 @@ def objective(trial: optuna.trial.Trial):
 
     model = BiLSTMNet(input_size, hidden_size, output_size).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.MSELoss()
+    criterion = nn.MSELoss()  # we are minimizing MSE
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=10
     )
 
-    best_val_loss, best_state_dict = train_model(
+    best_val_loss, best_state = train_model(
         model,
         optimizer,
         scheduler,
@@ -289,44 +342,35 @@ def objective(trial: optuna.trial.Trial):
         trial=trial,
     )
 
-    if GLOBAL_RANK == 0 and best_state_dict is not None:
+    if best_state is not None:
         checkpoint_path = os.path.join(
-            CHECKPOINT_DIR, f"worker_{GLOBAL_RANK}_trial_{trial.number}_best.pth"
+            CHECKPOINT_DIR, f"rank{GLOBAL_RANK}_trial{trial.number}_best.pth"
         )
-        torch.save(best_state_dict, checkpoint_path)
+        torch.save(best_state, checkpoint_path)
         trial.set_user_attr("checkpoint_path", checkpoint_path)
         trial.set_user_attr("hyperparameters", trial.params)
 
-    return best_val_loss
+    return best_val_loss  # Optuna minimizes this
 
 # ---------------------------------------------------------
-# Main: multi-GPU hyperparameter search
+# Main: multi-process, multi-GPU Optuna
 # ---------------------------------------------------------
 if __name__ == "__main__":
-    if GLOBAL_RANK == 0 and os.path.exists(DB_PATH):
-        os.remove(DB_PATH)
-
     STORAGE_PATH = f"sqlite:///{DB_PATH}"
-
     if GLOBAL_RANK == 0:
         print(f"Starting hyperparameter optimization study: {STUDY_NAME}")
         print(f"Using Optuna storage: {STORAGE_PATH}")
+        print(f"WORLD_SIZE (GPUs/processes): {WORLD_SIZE}")
 
-    if GLOBAL_RANK == 0:
-        study = optuna.create_study(
-            direction="minimize",
-            study_name=STUDY_NAME,
-            storage=STORAGE_PATH,
-            pruner=optuna.pruners.MedianPruner(
-                n_startup_trials=5, n_warmup_steps=30
-            ),
-        )
-    else:
-        study = optuna.load_study(
-            study_name=STUDY_NAME,
-            storage=STORAGE_PATH,
-        )
+    study = optuna.create_study(
+        direction="minimize",
+        study_name=STUDY_NAME,
+        storage=STORAGE_PATH,
+        load_if_exists=True,
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=30),
+    )
 
+    # Distribute total trials across workers
     trials_per_worker = math.ceil(TOTAL_TRIALS / WORLD_SIZE)
 
     study.optimize(
@@ -335,6 +379,7 @@ if __name__ == "__main__":
         show_progress_bar=(GLOBAL_RANK == 0),
     )
 
+    # Only rank 0 saves the final "best overall" model
     if GLOBAL_RANK == 0:
         print("\nOptimization finished.")
         best_trial = study.best_trial
@@ -348,6 +393,9 @@ if __name__ == "__main__":
         final_model = BiLSTMNet(input_size, best_trial.params["hidden_size"], output_size)
         final_model.load_state_dict(best_state_dict)
 
-        final_path = os.path.join(OUTPUT_DIR, "best_lstm_model.pth")
+        # ---- THIS IS THE LINE WITH THE MODEL FILE NAME ----
+        date_str = datetime.now().strftime("%Y%m%d")
+        model_filename = f"bilstm_option_{date_str}.pth"
+        final_path = os.path.join(OUTPUT_DIR, model_filename)
         torch.save(final_model.state_dict(), final_path)
         print(f"Saved the best model to {final_path}")
