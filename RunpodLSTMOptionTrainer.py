@@ -1,406 +1,629 @@
 import os
 import math
-from datetime import datetime
+import time
+import random
+import argparse
+import multiprocessing
+import gc
 
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
-import pandas as pd
-import numpy as np
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, Dataset
 from sklearn.model_selection import train_test_split
-import optuna
 
-# ---------------------------------------------------------
-# Environment / device setup (one process per GPU)
-# To run on Runpod (e.g., 4 GPUs):
-#   torchrun --standalone --nnodes=1 --nproc_per_node=4 RunpodLSTMOptionTrainer.py
-# ---------------------------------------------------------
-LOCAL_RANK = int(os.environ.get("LOCAL_RANK", "0"))
-GLOBAL_RANK = int(os.environ.get("RANK", "0"))
-WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "1"))
-
-if torch.cuda.is_available():
-    device = torch.device(f"cuda:{LOCAL_RANK}")
-else:
-    device = torch.device("cpu")
-
-# ---------------------------------------------------------
-# Paths & constants
-# ---------------------------------------------------------
-DATA_PATH = "/workspace/lstm-project/data/TSLA_Options_Chain_With_Indicators.csv"
-
-BASE_DIR = "/workspace/lstm-project"
-DB_PATH = os.path.join(BASE_DIR, "optuna_study.db")
-CHECKPOINT_DIR = os.path.join(BASE_DIR, "optuna_checkpoints")
-OUTPUT_DIR = "/workspace/output"
-
-STUDY_NAME = "lstm_hyperparameter_study"
-TOTAL_TRIALS = 50  # approximate global budget across all ranks
-PREDICTION_HORIZON = 14  # predict strike 14 steps (~2 weeks) ahead
-
-os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-# ---------------------------------------------------------
-# Data loading and preprocessing
-# ---------------------------------------------------------
+# Try importing optuna
 try:
-    df = pd.read_csv(DATA_PATH)
-except Exception as e:
-    if GLOBAL_RANK == 0:
-        raise SystemExit(f"Failed to read data at {DATA_PATH}: {e}")
-    else:
-        raise
+    import optuna
+except ImportError:
+    optuna = None
+#This code implements a BiLSTM model trainer for time series data, specifically designed for predicting stock option prices.
+# It includes model definition, dataset handling, training routines, and hyperparameter optimization using random search or Optuna.
+#To run this code
+55# torchrun --standalone --nnodes=1 --nproc_per_node=8 trainer.py \
+#   --mode random \
+#   --csv /workspace/TSLA_Options_Chain_Historical_combined.csv \
+#   --trials 80
 
-# Normalize column names
-df.columns = df.columns.str.strip().str.lower()
-
-# Basic sanity check: we need 'strike' as target
-if "strike" not in df.columns:
-    if GLOBAL_RANK == 0:
-        raise SystemExit("Input CSV must contain a 'strike' column (case-insensitive).")
-    else:
-        raise SystemExit()
-
-# Parse dates to build useful numeric features
-if "date" not in df.columns or "expiration" not in df.columns:
-    if GLOBAL_RANK == 0:
-        raise SystemExit("CSV must contain 'date' and 'expiration' columns.")
-    else:
-        raise SystemExit()
-
-df["date"] = pd.to_datetime(df["date"])
-df["expiration"] = pd.to_datetime(df["expiration"])
-
-# Days to expiration as a numeric feature
-df["days_to_expiration"] = (df["expiration"] - df["date"]).dt.days.astype(np.float32)
-
-# Encode option type (call/put) into a numeric feature
-# Adjust mapping if your 'type' values differ (e.g. 'C'/'P', 'CALL'/'PUT', etc.)
-if "type" in df.columns:
-    type_map = {
-        "C": 1.0,
-        "CALL": 1.0,
-        "P": 0.0,
-        "PUT": 0.0,
-    }
-    df["type_encoded"] = (
-        df["type"].astype(str).str.upper().map(type_map).fillna(0.0).astype(np.float32)
-    )
-else:
-    df["type_encoded"] = 0.0  # fallback if missing
-
-# Sort by date (and expiration as a secondary key) to define a time order
-df = df.sort_values(["date", "expiration", "strike"]).reset_index(drop=True)
-
-# Target: we predict future strike
-prices = df["strike"].values.astype(np.float32)
-
-# ---------------------------------------------------------
-# Feature selection
-# You said the CSV columns are:
-# contractid, expiration, strike, type, last, mark, bid, bid_size, ask, ask_size,
-# volume, open_interest, date, implied_volatility, delta, gamma, theta, vega, rho,
-# rsi, vwap, sma_25, sma_50, sma_100, sma_200
-#
-# We drop non-numeric IDs / raw text, and keep numeric versions.
-# ---------------------------------------------------------
-numeric_feature_cols = [
-    # NOTE: we deliberately SKIP 'contractid', 'date', 'expiration', and raw 'type'
-    "strike",
-    "last",
-    "mark",
-    "bid",
-    "bid_size",
-    "ask",
-    "ask_size",
-    "volume",
-    "open_interest",
-    "implied_volatility",
-    "delta",
-    "gamma",
-    "theta",
-    "vega",
-    "rho",
-    "rsi",
-    "vwap",
-    "sma_25",
-    "sma_50",
-    "sma_100",
-    "sma_200",
-    "days_to_expiration",
-    "type_encoded",
-]
-
-# Keep only those that are actually in the dataframe
-feature_cols = [c for c in numeric_feature_cols if c in df.columns]
-
-if len(feature_cols) == 0:
-    if GLOBAL_RANK == 0:
-        raise SystemExit("No recognized numeric feature columns found in CSV.")
-    else:
-        raise SystemExit()
-
-features_df = df[feature_cols].copy()
-
-# ---- FIX: force all feature columns to numeric to avoid string values ----
-for col in features_df.columns:
-    features_df[col] = pd.to_numeric(features_df[col], errors="coerce")
-
-# Drop zero-variance features (constant columns)
-stds = features_df.std()  # now safe: all columns are numeric (or NaN)
-zero_std_cols = stds[stds < 1e-6].index
-if not zero_std_cols.empty and GLOBAL_RANK == 0:
-    print(f"Warning: Removing zero-variance features: {list(zero_std_cols)}")
-if not zero_std_cols.empty:
-    features_df = features_df.drop(columns=zero_std_cols)
-    feature_cols = features_df.columns.tolist()
-
-features = features_df.values.astype(np.float32)
-input_size = len(feature_cols)
-output_size = 1  # predict a single value (future strike)
-
-# Train/validation split (no leakage)
-train_features, val_features, train_prices, val_prices = train_test_split(
-    features, prices, test_size=0.2, shuffle=False
-)
-
-# Normalization based on training slice only
-train_feature_mean = train_features.mean(axis=0)
-train_feature_std = train_features.std(axis=0) + 1e-9
-train_price_mean = train_prices.mean()
-train_price_std = train_prices.std() + 1e-9
-
-train_features = (train_features - train_feature_mean) / train_feature_std
-val_features = (val_features - train_feature_mean) / train_feature_std
-
-normalized_train_prices = (train_prices - train_price_mean) / train_price_std
-normalized_val_prices = (val_prices - train_price_mean) / train_price_std
-
-# ---------------------------------------------------------
-# Sequence creation (fixed prediction horizon)
-# ---------------------------------------------------------
-def create_sequences(features, prices, seq_length, horizon=PREDICTION_HORIZON):
-    """
-    Build sequences of length `seq_length` and targets `horizon` steps ahead.
-
-    X[t]  = features[t : t+seq_length]
-    y[t]  = prices[t + seq_length + horizon - 1]
-    """
-    xs, ys = [], []
-    max_start = len(features) - seq_length - horizon + 1
-    if max_start <= 0:
-        return np.array([]), np.array([])
-    for i in range(max_start):
-        xs.append(features[i : i + seq_length])
-        ys.append(prices[i + seq_length + horizon - 1])
-    return np.array(xs), np.array(ys)
-
-# ---------------------------------------------------------
-# Model
-# ---------------------------------------------------------
+# =========================
+#  Model Definition
+# =========================
 class BiLSTMNet(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size):
-        super().__init__()
+    def __init__(self, input_size, hidden_size, output_size, num_layers=2, dropout=0.1):
+        super(BiLSTMNet, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+
         self.lstm = nn.LSTM(
             input_size,
             hidden_size,
+            num_layers,
             batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
             bidirectional=True,
         )
-        self.fc = nn.Linear(hidden_size * 2, output_size)
+
+        self.layer_norm = nn.LayerNorm(hidden_size * 2)
+
+        self.head = nn.Sequential(
+            nn.Linear(hidden_size * 2, max(64, hidden_size)),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(max(64, hidden_size), output_size),
+        )
 
     def forward(self, x):
-        out, _ = self.lstm(x)
-        out = self.fc(out[:, -1, :])
+        batch_size = x.size(0)
+        h0 = x.new_zeros(self.num_layers * 2, batch_size, self.hidden_size)
+        c0 = x.new_zeros(self.num_layers * 2, batch_size, self.hidden_size)
+
+        out, _ = self.lstm(x, (h0, c0))
+        last = out[:, -1, :]
+        last = self.layer_norm(last)
+        out = self.head(last)
         return out
 
-# ---------------------------------------------------------
-# Training loop
-# ---------------------------------------------------------
-def train_model(
-    model,
-    optimizer,
-    scheduler,
-    criterion,
-    train_loader,
-    val_loader,
-    device,
-    epochs,
-    trial: optuna.trial.Trial = None,
-    patience=20,
-    min_delta=1e-5,
+
+def init_weights(module: nn.Module):
+    if isinstance(module, nn.Linear):
+        nn.init.kaiming_normal_(module.weight, nonlinearity="relu")
+        if module.bias is not None:
+            nn.init.constant_(module.bias, 0.0)
+    elif isinstance(module, nn.LSTM):
+        for name, param in module.named_parameters():
+            if "weight_ih" in name:
+                nn.init.xavier_uniform_(param.data)
+            elif "weight_hh" in name:
+                nn.init.orthogonal_(param.data)
+            elif "bias" in name:
+                nn.init.constant_(param.data, 0.0)
+
+
+# =========================
+#  Dataset
+# =========================
+class SequenceDataset(Dataset):
+    def __init__(self, features_tensor, prices_tensor, seq_length: int):
+        self.features = features_tensor
+        self.prices = prices_tensor
+        self.seq_length = int(seq_length)
+        self.n = self.features.size(0)
+        self.len = max(0, self.n - self.seq_length)
+
+    def __len__(self):
+        return self.len
+
+    def __getitem__(self, idx):
+        start = idx
+        end = idx + self.seq_length
+        x = self.features[start:end]
+        y = self.prices[end].unsqueeze(0)
+        return x, y
+
+
+# =========================
+#  Utility: convert loss -> dollars
+# =========================
+def val_mae_to_dollars(val_mae: float, effective_price_std: float) -> float:
+    """Convert normalized MAE to average absolute error in dollars."""
+    return float(val_mae) * float(effective_price_std)
+
+
+# =========================
+#  Training Utility
+# =========================
+def train_one_config(
+        config,
+        train_features,
+        train_prices_norm,
+        val_features,
+        val_prices_norm,
+        input_size,
+        output_size,
+        device,
+        num_workers,
+        use_amp,
+        max_seconds_per_trial,
+        effective_price_std,
 ):
-    best_val_loss = float("inf")
+    hidden_size = config["hidden_size"]
+    seq_length = config["seq_length"]
+    lr = config["lr"]
+    epochs = config["epochs"]
+    batch_size = config["batch_size"]
+
+    # Re-init datasets with new seq_length
+    train_dataset = SequenceDataset(train_features, train_prices_norm, seq_length)
+    val_dataset = SequenceDataset(val_features, val_prices_norm, seq_length)
+
+    if len(train_dataset) < 2:
+        return float("inf"), float("inf"), None, 0.0
+
+    batch_size = min(batch_size, len(train_dataset))
+    if batch_size < 1:
+        batch_size = 1
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=(device.type == "cuda"),
+        persistent_workers=(num_workers > 0),
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=(device.type == "cuda"),
+        persistent_workers=(num_workers > 0),
+    )
+
+    model = BiLSTMNet(input_size, hidden_size, output_size, num_layers=2, dropout=0.1)
+    model.apply(init_weights)
+    model.to(device)
+
+    # Optimization Objective (Gradient Friendly)
+    train_criterion = nn.SmoothL1Loss()
+    # Selection Objective (Dollar Friendly)
+    report_criterion = nn.L1Loss()
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs))
+    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+
+    # Track best by DOLLARS
+    best_val_dollars = float("inf")
+    best_val_mae = float("inf")  # <-- We now specifically track the BEST MAE
     best_state = None
     epochs_no_improve = 0
+    patience = 3
+
+    start_trial_time = time.time()
 
     for epoch in range(epochs):
         model.train()
-        train_loss_sum = 0.0
+        try:
+            for xb, yb in train_loader:
+                xb = xb.to(device, non_blocking=True)
+                yb = yb.to(device, non_blocking=True)
 
-        for xb, yb in train_loader:
-            xb = xb.to(device)
-            yb = yb.to(device)
+                if use_amp:
+                    with torch.cuda.amp.autocast():
+                        pred = model(xb)
+                        loss = train_criterion(pred, yb)
+                    optimizer.zero_grad(set_to_none=True)
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    pred = model(xb)
+                    loss = train_criterion(pred, yb)
+                    optimizer.zero_grad(set_to_none=True)
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                print(f"OOM with config: {config}")
+                torch.cuda.empty_cache()
+                return float("inf"), float("inf"), None, 0.0
+            else:
+                raise
 
-            pred = model(xb)
-            loss = criterion(pred, yb)
-
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-
-            train_loss_sum += loss.item()
-
+        # Validation
         model.eval()
-        val_loss_sum = 0.0
+        epoch_val_mae = 0.0
+        val_samples = 0
         with torch.no_grad():
             for xb, yb in val_loader:
-                xb = xb.to(device)
-                yb = yb.to(device)
-                pred = model(xb)
-                val_loss_sum += criterion(pred, yb).item()
+                xb = xb.to(device, non_blocking=True)
+                yb = yb.to(device, non_blocking=True)
 
-        avg_train_loss = train_loss_sum / max(len(train_loader), 1)
-        avg_val_loss = val_loss_sum / max(len(val_loader), 1)
+                if use_amp:
+                    with torch.cuda.amp.autocast():
+                        pred = model(xb)
+                        batch_mae = report_criterion(pred, yb).item()
+                else:
+                    pred = model(xb)
+                    batch_mae = report_criterion(pred, yb).item()
 
-        # Scheduler on validation loss
-        try:
-            scheduler.step(avg_val_loss)
-        except Exception:
-            pass
+                epoch_val_mae += batch_mae * xb.size(0)
+                val_samples += xb.size(0)
 
-        # Optuna pruning (only on rank 0 to avoid conflicts)
-        if trial is not None and GLOBAL_RANK == 0:
-            trial.report(avg_val_loss, epoch)
-            if trial.should_prune():
-                raise optuna.exceptions.TrialPruned()
+        avg_val_mae = epoch_val_mae / max(1, val_samples)
+        current_dollars = val_mae_to_dollars(avg_val_mae, effective_price_std)
 
-        # Track best model
-        if avg_val_loss < best_val_loss - min_delta:
-            best_val_loss = avg_val_loss
-            epochs_no_improve = 0
+        scheduler.step()
+
+        # Dollar-based early stopping + best tracking
+        if current_dollars < best_val_dollars:
+            best_val_dollars = current_dollars
+            best_val_mae = avg_val_mae  # <-- Store the MAE associated with this best dollar value
             best_state = model.state_dict()
+            epochs_no_improve = 0
         else:
             epochs_no_improve += 1
+            if epochs_no_improve >= patience:
+                break
 
-        if epochs_no_improve >= patience:
+        # Time-based cutoff
+        if time.time() - start_trial_time > max_seconds_per_trial:
             break
 
-    return best_val_loss, best_state
+    total_time = time.time() - start_trial_time
 
-# ---------------------------------------------------------
-# Optuna objective
-# ---------------------------------------------------------
-def objective(trial: optuna.trial.Trial):
-    if GLOBAL_RANK == 0:
-        print(f"Starting Optuna trial {trial.number} on rank {GLOBAL_RANK}")
+    # RETURN THE BEST MAE (not the last epoch's MAE)
+    return best_val_dollars, best_val_mae, best_state, total_time
 
-    hidden_size = trial.suggest_int("hidden_size", 30, 90)
-    sequence_length = trial.suggest_int("sequence_length", 14, 50)
-    lr = trial.suggest_float("lr", 1e-4, 1e-1, log=True)
-    epochs = trial.suggest_int("epochs", 50, 200)
-    batch_size = trial.suggest_categorical("batch_size", [32, 48, 64, 96, 128])
 
-    X_train, y_train = create_sequences(
-        train_features, normalized_train_prices, sequence_length
-    )
-    X_val, y_val = create_sequences(
-        val_features, normalized_val_prices, sequence_length
-    )
+def main():
+    parser = argparse.ArgumentParser(description="Hybrid BiLSTM trainer: 8x RTX 6000 Edition.")
 
-    if len(X_train) == 0 or len(X_val) == 0:
-        return float("inf")
+    parser.add_argument("--mode", type=str, default="random", choices=["random", "optuna"])
+    parser.add_argument("--csv", "-c", default=r"C:\My Documents\Mics\Logs\TSLA_Options_Chain_Historical_combined.csv")
+    parser.add_argument("--target", "-t", default=None)
+    parser.add_argument("--max-rows", type=int, default=None)
+    parser.add_argument("--dry-run", action="store_true")
 
-    X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
-    y_train_tensor = torch.tensor(y_train, dtype=torch.float32).unsqueeze(1)
-    X_val_tensor = torch.tensor(X_val, dtype=torch.float32)
-    y_val_tensor = torch.tensor(y_val, dtype=torch.float32).unsqueeze(1)
+    # === RTX 6000 TUNED DEFAULTS ===
+    parser.add_argument("--trials", type=int, default=80)
+    parser.add_argument("--hidden-min", type=int, default=256)
+    parser.add_argument("--hidden-max", type=int, default=1024)
+    parser.add_argument("--seq-min", type=int, default=20)
+    parser.add_argument("--seq-max", type=int, default=80)
+    parser.add_argument("--batch-min", type=int, default=4096)
+    parser.add_argument("--batch-max", type=int, default=32768)
+    parser.add_argument("--epochs-min", type=int, default=5)
+    parser.add_argument("--epochs-max", type=int, default=20)
+    parser.add_argument("--lr-min", type=float, default=1e-4)
+    parser.add_argument("--lr-max", type=float, default=3e-3)
 
-    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
-    val_dataset = TensorDataset(X_val_tensor, y_val_tensor)
+    parser.add_argument("--max-seconds-per-trial", type=int, default=600)
+    parser.add_argument("--target-scale", type=float, default=1.0)
+    parser.add_argument("--num-workers", type=int, default=None)
+    parser.add_argument("--output-prefix", type=str, default="tsla_bilstm_model_best")
 
-    pin_memory = device.type == "cuda"
-    train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True, pin_memory=pin_memory
-    )
-    val_loader = DataLoader(
-        val_dataset, batch_size=batch_size, shuffle=False, pin_memory=pin_memory
-    )
+    parser.add_argument("--optuna-storage", type=str, default=None)
+    parser.add_argument("--optuna-study-name", type=str, default="tsla_bilstm_optuna")
 
-    model = BiLSTMNet(input_size, hidden_size, output_size).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.MSELoss()  # we are minimizing MSE
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=10
-    )
+    args = parser.parse_args()
 
-    best_val_loss, best_state = train_model(
-        model,
-        optimizer,
-        scheduler,
-        criterion,
-        train_loader,
-        val_loader,
-        device,
-        epochs,
-        trial=trial,
-    )
+    # Environment
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    global_rank = int(os.environ.get("RANK", "0"))
 
-    if best_state is not None:
-        checkpoint_path = os.path.join(
-            CHECKPOINT_DIR, f"rank{GLOBAL_RANK}_trial{trial.number}_best.pth"
+    if torch.cuda.is_available():
+        if torch.cuda.device_count() > 1 and world_size > 1:
+            device = torch.device(f"cuda:{local_rank}")
+        else:
+            device = torch.device("cuda:0")
+    else:
+        device = torch.device("cpu")
+
+    # Seed
+    seed = 42 + global_rank
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    # Worker Calc
+    try:
+        cpu_count = multiprocessing.cpu_count()
+    except Exception:
+        cpu_count = 8
+
+    if args.num_workers is not None:
+        num_workers = args.num_workers
+    else:
+        num_workers = max(1, min(8, cpu_count // max(1, world_size)))
+
+    if global_rank == 0:
+        print(
+            f"Global Config: Workers={num_workers}, Device Count={torch.cuda.device_count()}, World Size={world_size}")
+
+    # =========================
+    #  Load Data
+    # =========================
+    if not os.path.exists(args.csv):
+        if global_rank == 0:
+            print(f"CSV not found: {args.csv}. Generating dummy data.")
+        df = pd.DataFrame(
+            np.random.randn(10000, 20),
+            columns=["close", "last", "mark"] + [f"f{i}" for i in range(17)]
         )
-        torch.save(best_state, checkpoint_path)
-        trial.set_user_attr("checkpoint_path", checkpoint_path)
-        trial.set_user_attr("hyperparameters", trial.params)
+        df["date"] = pd.date_range(start="2022-01-01", periods=10000)
+    else:
+        if args.max_rows:
+            df = pd.read_csv(args.csv, low_memory=False, nrows=args.max_rows)
+        else:
+            df = pd.read_csv(args.csv, low_memory=False)
 
-    return best_val_loss  # Optuna minimizes this
+    df.columns = df.columns.str.strip().str.lower()
+    df.dropna(how="all", inplace=True)
 
-# ---------------------------------------------------------
-# Main: multi-process, multi-GPU Optuna
-# ---------------------------------------------------------
+    if args.target:
+        target_col = args.target
+    else:
+        if "last" in df.columns:
+            target_col = "last"
+        elif "close" in df.columns:
+            target_col = "close"
+        elif "mark" in df.columns:
+            target_col = "mark"
+        else:
+            target_col = df.columns[0]
+
+    df[target_col] = pd.to_numeric(df[target_col], errors="coerce")
+    df = df[~df[target_col].isna()].reset_index(drop=True)
+
+    feature_cols = [c for c in df.columns if c != target_col and df[c].dtype != "object"]
+    features_df = df[feature_cols].select_dtypes(include=[np.number]).fillna(0)
+
+    prices = df[target_col].values.astype(np.float32)
+    features = features_df.values.astype(np.float32)
+
+    # Lag 1
+    lag1 = np.concatenate(([0.0], prices[:-1])).astype(np.float32).reshape(-1, 1)
+    features = np.hstack([features, lag1])
+
+    input_size = features.shape[1]
+    output_size = 1
+
+    del df, features_df
+    gc.collect()
+
+    if args.dry_run:
+        if global_rank == 0:
+            print(f"Dry Run. Input dim: {input_size}. Samples: {len(prices)}")
+            print(f"Target column: {target_col}")
+        return
+
+    # Split & Normalize
+    train_features_raw, val_features_raw, train_prices, val_prices = train_test_split(
+        features, prices, test_size=0.2, shuffle=False
+    )
+
+    feat_mean = train_features_raw.mean(axis=0)
+    feat_std = train_features_raw.std(axis=0)
+    feat_std[feat_std == 0] = 1.0
+
+    price_mean = train_prices.mean()
+    raw_price_std = train_prices.std() if train_prices.std() != 0 else 1.0
+    target_scale = float(args.target_scale)
+    effective_price_std = raw_price_std * target_scale
+
+    train_features = (train_features_raw - feat_mean) / feat_std
+    val_features = (val_features_raw - feat_mean) / feat_std
+    train_prices_norm = (train_prices - price_mean) / effective_price_std
+    val_prices_norm = (val_prices - price_mean) / effective_price_std
+
+    del features, prices, train_features_raw, val_features_raw
+    gc.collect()
+
+    train_features = torch.from_numpy(train_features).float()
+    val_features = torch.from_numpy(val_features).float()
+    train_prices_norm = torch.from_numpy(train_prices_norm).float()
+    val_prices_norm = torch.from_numpy(val_prices_norm).float()
+
+    torch.backends.cudnn.benchmark = True
+    use_amp = device.type == "cuda"
+
+    trials = args.trials
+    approx_len = train_features.size(0)
+    batch_max = args.batch_max
+    if approx_len < batch_max:
+        batch_max = max(args.batch_min, approx_len // 2)
+
+    print(
+        f"[Rank {global_rank}] Config Ranges: "
+        f"Hidden=[{args.hidden_min}, {args.hidden_max}], "
+        f"Batch=[{args.batch_min}, {batch_max}], "
+        f"Trials={trials}"
+    )
+
+    # =========================
+    #  MODE: RANDOM SEARCH
+    # =========================
+    if args.mode == "random":
+        best_global_dollars = float("inf")
+        best_global_mae = float("inf")
+        best_global_state = None
+        best_global_params = None
+
+        for trial_idx in range(trials):
+            hidden_size = random.randint(args.hidden_min, args.hidden_max)
+            seq_length = random.randint(args.seq_min, args.seq_max)
+            epochs = random.randint(args.epochs_min, args.epochs_max)
+
+            min_bs_pow = int(math.log2(max(1, args.batch_min)))
+            max_bs_pow = int(math.log2(max(1, batch_max)))
+            bs_pow = random.randint(min_bs_pow, max_bs_pow)
+            batch_size = 2 ** bs_pow
+
+            lr = 10 ** random.uniform(math.log10(args.lr_min), math.log10(args.lr_max))
+
+            config = {
+                "hidden_size": hidden_size,
+                "seq_length": seq_length,
+                "epochs": epochs,
+                "batch_size": batch_size,
+                "lr": lr,
+            }
+
+            print(f"[Rank {global_rank}] Trial {trial_idx + 1}/{trials}: {config}")
+
+            val_dollars, val_mae, state_dict, took = train_one_config(
+                config,
+                train_features,
+                train_prices_norm,
+                val_features,
+                val_prices_norm,
+                input_size,
+                output_size,
+                device,
+                num_workers,
+                use_amp,
+                args.max_seconds_per_trial,
+                effective_price_std,
+            )
+
+            print(
+                f"[Rank {global_rank}]    -> result=${val_dollars:.4f} "
+                f"(norm-MAE={val_mae:.6f}, time={took:.1f}s)"
+            )
+
+            if state_dict is not None and val_dollars < best_global_dollars:
+                best_global_dollars = val_dollars
+                best_global_mae = val_mae
+                best_global_state = state_dict
+                best_global_params = config
+                print(
+                    f"[Rank {global_rank}]    *** NEW BEST (Dollars): "
+                    f"${best_global_dollars:.4f} ***"
+                )
+
+        if best_global_state:
+            loss_str = f"{best_global_dollars:.4f}".replace(".", "_")
+            out_name = f"{args.output_prefix}_rank{global_rank}_dollars{loss_str}.pth"
+            save_obj = {
+                "state_dict": best_global_state,
+                "best_loss_dollars": best_global_dollars,
+                "best_val_mae": best_global_mae,
+                "best_params": best_global_params,
+                "rank": global_rank,
+                "scaler_stats": {
+                    "feat_mean": feat_mean,
+                    "feat_std": feat_std,
+                    "price_mean": price_mean,
+                    "price_std": raw_price_std,
+                    "effective_price_std": effective_price_std,
+                    "target_scale": target_scale,
+                },
+            }
+            torch.save(save_obj, out_name)
+            print(f"[Rank {global_rank}] Saved best model to {out_name}")
+
+    # =========================
+    #  MODE: OPTUNA
+    # =========================
+    elif args.mode == "optuna":
+        if optuna is None:
+            raise ImportError("Optuna is not installed.")
+
+        def optuna_objective(trial: "optuna.trial.Trial"):
+            hidden_size = trial.suggest_int("hidden_size", args.hidden_min, args.hidden_max)
+            seq_length = trial.suggest_int("seq_length", args.seq_min, args.seq_max)
+            epochs = trial.suggest_int("epochs", args.epochs_min, args.epochs_max)
+            log_lr = trial.suggest_float("log_lr", math.log10(args.lr_min), math.log10(args.lr_max))
+
+            min_bs_pow = int(math.log2(max(1, args.batch_min)))
+            max_bs_pow = int(math.log2(max(1, batch_max)))
+            bs_pow = trial.suggest_int("bs_pow", min_bs_pow, max_bs_pow)
+
+            config = {
+                "hidden_size": hidden_size,
+                "seq_length": seq_length,
+                "epochs": epochs,
+                "batch_size": 2 ** bs_pow,
+                "lr": 10 ** log_lr,
+            }
+
+            val_dollars, val_mae, _, took = train_one_config(
+                config,
+                train_features,
+                train_prices_norm,
+                val_features,
+                val_prices_norm,
+                input_size,
+                output_size,
+                device,
+                num_workers,
+                use_amp,
+                args.max_seconds_per_trial,
+                effective_price_std,
+            )
+            trial.set_user_attr("time", took)
+            trial.set_user_attr("val_dollars", val_dollars)
+            trial.set_user_attr("val_mae", val_mae)
+            return val_dollars
+
+        if args.optuna_storage:
+            study = optuna.create_study(
+                study_name=args.optuna_study_name,
+                storage=args.optuna_storage,
+                direction="minimize",
+                load_if_exists=True,
+            )
+        else:
+            study = optuna.create_study(direction="minimize")
+
+        print(f"[Rank {global_rank}] Starting Optuna refinement for {trials} trials...")
+        study.optimize(optuna_objective, n_trials=trials)
+
+        print(f"[Rank {global_rank}] Optuna best value (dollars) = ${study.best_value:.4f}")
+        print(f"[Rank {global_rank}] Optuna best params: {study.best_params}")
+
+        best_p = study.best_params
+        final_config = {
+            "hidden_size": best_p["hidden_size"],
+            "seq_length": best_p["seq_length"],
+            "epochs": best_p["epochs"],
+            "batch_size": 2 ** best_p["bs_pow"],
+            "lr": 10 ** best_p["log_lr"],
+        }
+
+        final_dollars, final_mae, best_state, took = train_one_config(
+            final_config,
+            train_features,
+            train_prices_norm,
+            val_features,
+            val_prices_norm,
+            input_size,
+            output_size,
+            device,
+            num_workers,
+            use_amp,
+            args.max_seconds_per_trial,
+            effective_price_std,
+        )
+
+        if best_state:
+            loss_str = f"{final_dollars:.4f}".replace(".", "_")
+            out_name = f"{args.output_prefix}_optuna_rank{global_rank}_dollars{loss_str}.pth"
+            save_obj = {
+                "state_dict": best_state,
+                "best_loss_dollars": final_dollars,
+                "best_val_mae": final_mae,
+                "best_params": final_config,
+                "rank": global_rank,
+                "scaler_stats": {
+                    "feat_mean": feat_mean,
+                    "feat_std": feat_std,
+                    "price_mean": price_mean,
+                    "price_std": raw_price_std,
+                    "effective_price_std": effective_price_std,
+                    "target_scale": target_scale,
+                },
+                "optuna_best_raw": {
+                    "value_dollars": study.best_value,
+                    "params": study.best_params,
+                },
+            }
+            torch.save(save_obj, out_name)
+            print(
+                f"[Rank {global_rank}] Saved Optuna-refined model to {out_name} "
+                f"(~${final_dollars:.4f}, norm-MAE={final_mae:.6f})"
+            )
+
+
 if __name__ == "__main__":
-    STORAGE_PATH = f"sqlite:///{DB_PATH}"
-    if GLOBAL_RANK == 0:
-        print(f"Starting hyperparameter optimization study: {STUDY_NAME}")
-        print(f"Using Optuna storage: {STORAGE_PATH}")
-        print(f"WORLD_SIZE (GPUs/processes): {WORLD_SIZE}")
-
-    study = optuna.create_study(
-        direction="minimize",
-        study_name=STUDY_NAME,
-        storage=STORAGE_PATH,
-        load_if_exists=True,
-        pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=30),
-    )
-
-    # Distribute total trials across workers
-    trials_per_worker = math.ceil(TOTAL_TRIALS / WORLD_SIZE)
-
-    study.optimize(
-        objective,
-        n_trials=trials_per_worker,
-        show_progress_bar=(GLOBAL_RANK == 0),
-    )
-
-    # Only rank 0 saves the final "best overall" model
-    if GLOBAL_RANK == 0:
-        print("\nOptimization finished.")
-        best_trial = study.best_trial
-        print(f"Best trial value (Validation Loss): {best_trial.value}")
-        print(f"Best hyperparameters: {best_trial.params}")
-
-        best_checkpoint = best_trial.user_attrs["checkpoint_path"]
-        print(f"Loading best model weights from: {best_checkpoint}")
-
-        best_state_dict = torch.load(best_checkpoint, map_location="cpu")
-        final_model = BiLSTMNet(input_size, best_trial.params["hidden_size"], output_size)
-        final_model.load_state_dict(best_state_dict)
-
-        date_str = datetime.now().strftime("%Y%m%d")
-        model_filename = f"bilstm_option_{date_str}.pth"
-        final_path = os.path.join(OUTPUT_DIR, model_filename)
-        torch.save(final_model.state_dict(), final_path)
-        print(f"Saved the best model to {final_path}")
+    main()
