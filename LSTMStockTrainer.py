@@ -1,221 +1,242 @@
-import torch
-import torch.nn as nn
-import pandas as pd
+import argparse
+import os
 import numpy as np
-import matplotlib.pyplot as plt
-from torch.utils.data import DataLoader, TensorDataset
-from sklearn.model_selection import train_test_split
-import random
+import pandas as pd
+import duckdb
 
-#
-#This Code Performs Hyperparameter Optimization for a Bidirectional LSTM Model on TSLA Stock Data
-#This code trians multiple BiLSTM models with different hyperparameters to find the best configuration(With the lowest validation loss & Trail = 3000)
-#
-# --- Step 1: Detect device, load and process data ---
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
+# --- CONFIGURATION ---
+CONTRACT_MULTIPLIER = 100.0  # US equity option standard
 
-# Load data and convert all column names to lowercase for consistency
-df = pd.read_csv(r'C:\My Documents\Mics\Logs\tsla_daily.csv')
-df.columns = df.columns.str.strip().str.lower()
-df = df.dropna()
 
-prices = df['close'].values.astype(np.float32)
-price_mean = prices.mean()
-price_std = prices.std()
+def interpolate_linear(curve_df: pd.DataFrame, target_dte: int, col: str) -> float:
+    """
+    Linear interpolation on a (dte -> value) curve.
+    If target is outside range, returns closest endpoint.
+    """
+    curve_df = curve_df.dropna(subset=["dte", col]).sort_values("dte")
+    if curve_df.empty:
+        return 0.0
 
-feature_cols = [
-    'open', 'high', 'low', 'close', 'volume', 'rsi', 'vwap', 'sma_25', 'sma_50',
-    'sma_100', 'sma_200', 'wti', 'vix', 'dxy', 'spy', 'macd_12_26_9'
-]
-features_df = df[feature_cols].copy()
+    # Exact match
+    exact = curve_df[curve_df["dte"] == target_dte]
+    if not exact.empty:
+        return float(exact.iloc[0][col])
 
-stds = features_df.std()
-zero_std_cols = stds[stds < 1e-6].index
-if not zero_std_cols.empty:
-    print(f"Warning: Removing zero-variance features: {list(zero_std_cols)}")
-    features_df = features_df.drop(columns=zero_std_cols)
-    feature_cols = features_df.columns.tolist()
+    # Bracket
+    near = curve_df[curve_df["dte"] < target_dte]
+    far = curve_df[curve_df["dte"] > target_dte]
 
-features = features_df.values.astype(np.float32)
-features = (features - features.mean(axis=0)) / features.std(axis=0)
-normalized_prices = (prices - price_mean) / price_std
+    # Out of range => closest
+    if near.empty or far.empty:
+        idx = (curve_df["dte"] - target_dte).abs().idxmin()
+        return float(curve_df.loc[idx, col])
 
-input_size = len(feature_cols)
-output_size = 1
+    r1 = near.iloc[-1]
+    r2 = far.iloc[0]
+    d1, d2 = float(r1["dte"]), float(r2["dte"])
+    v1, v2 = float(r1[col]), float(r2[col])
 
-train_features, val_features, train_prices, val_prices = train_test_split(
-    features, normalized_prices, test_size=0.2, shuffle=False)
+    if d2 == d1:
+        return float(v1)
 
-def create_sequences(features, prices, seq_length):
-    xs, ys = [], []
-    if len(features) <= seq_length:
-        return np.array([]), np.array([])
-    for i in range(len(features) - seq_length):
-        xs.append(features[i:i + seq_length])
-        ys.append(prices[i + seq_length])
-    return np.array(xs), np.array(ys)
+    w = (target_dte - d1) / (d2 - d1)
+    return float(v1 + w * (v2 - v1))
 
-# Hyperparameter search space
-hidden_size_range = (30, 90)
-sequence_length_range = (14, 50)
-learning_rate_range = (0.001, 0.01)
-epochs_range = (50, 500) # Adjusted for reasonable training times
-trials = 3000 # Adjusted for reasonable training times
 
-batch_size_range = (32, 128)
-best_loss = float('inf')
-best_params = None
-best_model_path = r'C:\My Documents\Mics\Logs\tsla_bilstm_model_best.pth'
+def _ensure_datetime(df: pd.DataFrame, col: str) -> None:
+    if col in df.columns:
+        df[col] = pd.to_datetime(df[col], errors="coerce")
 
-# --- MODIFIED CODE: Define the Bidirectional LSTM model class ---
-# This class is now defined once, outside the loop.
-class BiLSTMNet(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size):
-        super().__init__()
-        # Change 1: Add bidirectional=True to the LSTM layer
-        self.lstm = nn.LSTM(
-            input_size,
-            hidden_size,
-            batch_first=True,
-            bidirectional=True
-        )
-        # Change 2: The linear layer now takes hidden_size * 2 as input
-        self.fc = nn.Linear(hidden_size * 2, output_size)
 
-    def forward(self, x):
-        out, _ = self.lstm(x)
-        # The output from the last time step is fed to the linear layer
-        out = self.fc(out[:, -1, :])
-        return out
+def build_surface_vectors(
+        daily_path: str,
+        options_path: str,
+        out_path: str,
+        target_dte: int = 14,
+        atm_delta_low: float = 0.40,
+        atm_delta_high: float = 0.60,
+        skew_delta_low: float = 0.20,
+        skew_delta_high: float = 0.30
+) -> None:
+    print("--- STARTING SURFACE GENERATOR ---")
+    print(f"Input Folder: {os.path.dirname(daily_path)}")
 
-for trial in range(trials):
-    hidden_size = random.randint(*hidden_size_range)
-    sequence_length = random.randint(*sequence_length_range)
-    learning_rate = 10 ** random.uniform(np.log10(learning_rate_range[0]), np.log10(learning_rate_range[1]))
-    epochs = random.randint(*epochs_range)
-    batch_size = random.randint(*batch_size_range)
-    patience = 20
-    min_delta = 1e-5
+    # 1. Validation
+    if not os.path.exists(daily_path):
+        raise FileNotFoundError(f"Daily file not found: {daily_path}")
+    if not os.path.exists(options_path):
+        raise FileNotFoundError(f"Options file not found: {options_path}")
 
-    print(f"\nTrial {trial+1}/{trials}: hidden={hidden_size}, seq_len={sequence_length}, lr={learning_rate:.5f}, epochs={epochs}, batch={batch_size}")
+    print("1. Loading Raw Files...")
+    df_daily = pd.read_csv(daily_path)
+    df_opts = pd.read_csv(options_path, low_memory=False)
 
-    X_train, y_train = create_sequences(train_features, train_prices, sequence_length)
-    X_val, y_val = create_sequences(val_features, val_prices, sequence_length)
+    # Normalize column names
+    df_daily.columns = df_daily.columns.str.strip().str.lower()
+    df_opts.columns = df_opts.columns.str.strip().str.lower()
 
-    if len(X_val) == 0:
-        print("Skipping trial, validation set is too small for this sequence length.")
-        continue
+    # Parse dates
+    date_col = 'date' if 'date' in df_daily.columns else 'Date'
+    if date_col not in df_daily.columns:
+        raise ValueError(f"Daily file missing 'date' column. Found: {df_daily.columns.tolist()}")
 
-    X_train_tensor = torch.tensor(X_train, dtype=torch.float32).to(device)
-    y_train_tensor = torch.tensor(y_train, dtype=torch.float32).unsqueeze(1).to(device)
-    X_val_tensor = torch.tensor(X_val, dtype=torch.float32).to(device)
-    y_val_tensor = torch.tensor(y_val, dtype=torch.float32).unsqueeze(1).to(device)
+    if date_col != 'date':
+        df_daily.rename(columns={date_col: "date"}, inplace=True)
 
-    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
-    val_dataset = TensorDataset(X_val_tensor, y_val_tensor)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    _ensure_datetime(df_daily, "date")
+    _ensure_datetime(df_opts, "date")
+    _ensure_datetime(df_opts, "expiration")
 
-    # Use the new BiLSTMNet class
-    model = BiLSTMNet(input_size, hidden_size, output_size).to(device)
-    criterion = nn.MSELoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=10)
+    df_daily = df_daily.dropna(subset=["date"]).sort_values("date")
+    df_opts = df_opts.dropna(subset=["date", "expiration"]).sort_values("date")
 
-    best_val_loss = float('inf')
-    epochs_no_improve = 0
-    best_model_state_for_trial = None
+    # 2. Mapping Price and VIX
+    print("2. Mapping Context (Price & VIX)...")
+    if "close" not in df_daily.columns:
+        raise ValueError("Daily file must contain 'close' column.")
 
-    for epoch in range(epochs):
-        model.train()
-        epoch_train_loss = 0
-        for xb, yb in train_loader:
-            pred = model(xb)
-            loss = criterion(pred, yb)
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            epoch_train_loss += loss.item()
+    df_daily = df_daily.set_index("date")
+    price_map = df_daily["close"].to_dict()
+    vix_map = df_daily["vix"].to_dict() if "vix" in df_daily.columns else {}
 
-        model.eval()
-        epoch_val_loss = 0
-        with torch.no_grad():
-            for xb, yb in val_loader:
-                pred = model(xb)
-                epoch_val_loss += criterion(pred, yb).item()
+    if not vix_map:
+        print("   WARNING: 'vix' column not found. 'vol_spread' will be 0.")
 
-        avg_train_loss = epoch_train_loss / len(train_loader)
-        avg_val_loss = epoch_val_loss / len(val_loader)
-        scheduler.step(avg_val_loss)
+    # Prepare options
+    df_opts["underlying_price"] = df_opts["date"].map(price_map)
+    df_opts = df_opts.dropna(subset=["underlying_price"])
 
-        if epoch % 10 == 0:
-            print(f"Epoch {epoch+1}, Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}")
+    df_opts["dte"] = (df_opts["expiration"] - df_opts["date"]).dt.days
+    df_opts = df_opts[df_opts["dte"] >= 0]
 
-        if avg_val_loss < best_val_loss - min_delta:
-            best_val_loss = avg_val_loss
-            epochs_no_improve = 0
-            best_model_state_for_trial = model.state_dict()
+    # Normalize Type
+    if "type" in df_opts.columns:
+        df_opts["type"] = df_opts["type"].astype(str).str.strip().str.lower()
+    else:
+        df_opts["type"] = "call"
+
+    # Fill Missing Greeks
+    for c in ["delta", "gamma", "vega", "open_interest", "implied_volatility"]:
+        if c not in df_opts.columns:
+            df_opts[c] = 0.0
+        df_opts[c] = pd.to_numeric(df_opts[c], errors="coerce").fillna(0.0)
+
+    # 3. Calculating Physics (Net Exposures)
+    print("3. Calculating Net Greek Exposures (GEX, DEX, VEX)...")
+
+    # DEX ($ per point move): delta * OI * 100 * Spot
+    df_opts["dex"] = df_opts["delta"] * df_opts["open_interest"] * CONTRACT_MULTIPLIER * df_opts["underlying_price"]
+
+    # VEX ($ per vol point): vega * OI * 100
+    df_opts["vex"] = df_opts["vega"] * df_opts["open_interest"] * CONTRACT_MULTIPLIER
+
+    # GEX ($ per 1% move): gamma * OI * 100 * Spot^2
+    df_opts["gex"] = (
+            df_opts["gamma"] * df_opts["open_interest"] * CONTRACT_MULTIPLIER * (df_opts["underlying_price"] ** 2)
+    )
+
+    # 4. Aggregation
+    print("4. Aggregating Surface via DuckDB...")
+    con = duckdb.connect()
+    con.register('df_opts', df_opts)
+
+    query = f"""
+    WITH base AS (
+        SELECT
+            date, dte, type, delta, implied_volatility,
+            dex, gex, vex
+        FROM df_opts
+    ),
+    curves AS (
+        SELECT
+            date, dte,
+            AVG(CASE
+                    WHEN ABS(delta) BETWEEN {atm_delta_low} AND {atm_delta_high}
+                    THEN implied_volatility
+                END) AS atm_iv,
+            AVG(CASE
+                    WHEN type = 'put' AND ABS(delta) BETWEEN {skew_delta_low} AND {skew_delta_high}
+                    THEN implied_volatility
+                END)
+            -
+            AVG(CASE
+                    WHEN type = 'call' AND ABS(delta) BETWEEN {skew_delta_low} AND {skew_delta_high}
+                    THEN implied_volatility
+                END) AS skew_25d
+        FROM base
+        GROUP BY date, dte
+    ),
+    greeks AS (
+        SELECT
+            date,
+            SUM(gex) AS total_gex,
+            SUM(dex) AS total_dex,
+            SUM(vex) AS total_vex
+        FROM base
+        GROUP BY date
+    )
+    SELECT c.*, g.total_gex, g.total_dex, g.total_vex
+    FROM curves c
+    LEFT JOIN greeks g ON c.date = g.date
+    """
+
+    df_curve = con.query(query).to_df()
+    df_curve["date"] = pd.to_datetime(df_curve["date"], errors="coerce")
+    df_curve = df_curve.dropna(subset=["date"])
+
+    # 5. Interpolation Loop
+    print("5. Interpolating Final Vectors...")
+    surface_rows = []
+
+    for day, day_curve in df_curve.groupby("date"):
+        vec = {"trade_date": day}
+
+        # Interpolate ATM IV @ target_dte
+        vec["atm_iv_14d"] = interpolate_linear(day_curve, target_dte, "atm_iv")
+
+        # Interpolate 25D skew @ target_dte
+        vec["skew_25d_14d"] = interpolate_linear(day_curve, target_dte, "skew_25d")
+
+        # Daily greek totals
+        vec["net_gamma_exposure"] = float(day_curve["total_gex"].max()) if "total_gex" in day_curve else 0.0
+        vec["net_delta_exposure"] = float(day_curve["total_dex"].max()) if "total_dex" in day_curve else 0.0
+        vec["net_vega_exposure"] = float(day_curve["total_vex"].max()) if "total_vex" in day_curve else 0.0
+
+        # Fear gap feature (IV - VIX)
+        vix_val = vix_map.get(day, np.nan)
+        if pd.notna(vix_val) and vec["atm_iv_14d"] > 0:
+            vec["vol_spread"] = vec["atm_iv_14d"] - (float(vix_val) / 100.0)
         else:
-            epochs_no_improve += 1
-        if epochs_no_improve >= patience:
-            print(f"Early stopping at epoch {epoch+1}")
-            break
+            vec["vol_spread"] = 0.0
 
-    print(f"Best validation loss for this trial: {best_val_loss:.6f}")
-    if best_val_loss < best_loss:
-        best_loss = best_val_loss
-        best_params = {
-            'hidden_size': hidden_size, 'sequence_length': sequence_length,
-            'learning_rate': learning_rate, 'epochs_run': epoch+1, 'batch_size': batch_size
-        }
-        torch.save(best_model_state_for_trial, best_model_path)
-        print(f"--- New best model saved with loss: {best_loss:.6f} ---")
+        surface_rows.append(vec)
 
-print("\n--- Hyperparameter Search Complete ---")
-print("Best hyperparameters found:")
-for k, v in best_params.items():
-    print(f"{k}: {v}")
-print(f"Best validation loss across all trials: {best_loss:.6f}")
+    df_out = pd.DataFrame(surface_rows).sort_values("trade_date").fillna(0.0)
 
-# --- Load the BEST model state before saving and plotting ---
-print(f"Loading best model from {best_model_path} for final save and plot.")
-# Use the BiLSTMNet class to instantiate the final model
-final_model = BiLSTMNet(input_size, best_params['hidden_size'], output_size)
-final_model.load_state_dict(torch.load(best_model_path))
+    # 6. Save
+    df_out.to_csv(out_path, index=False)
+    print(f"SUCCESS: Saved Surface Vector to {out_path}")
+    print(f"Stats: {len(df_out)} rows generated.")
+    print(f"Columns: {list(df_out.columns)}")
 
-save_path = r'C:\My Documents\Mics\Logs\tsla_bilstm_model_final.pth'
-torch.save(final_model.state_dict(), save_path)
-print(f"\nFinal best model saved to {save_path}")
 
-# --- Plotting Best Model Predictions ---
-print("\n--- Plotting Best Model Predictions ---")
-best_model = final_model # Use the already loaded final_model
-best_model.to(device)
-best_model.eval()
+def main():
+    ap = argparse.ArgumentParser()
 
-best_seq_length = best_params['sequence_length']
-X_val_plot, y_val_plot = create_sequences(val_features, val_prices, best_seq_length)
+    # --- HARDCODED DEFAULT PATHS ---
+    # The 'r' prefix handles the backslashes in Windows paths correctly
+    default_daily = r"C:\My Documents\Mics\Logs\tsla_daily.csv"
+    default_opts = r"C:\My Documents\Mics\Logs\TSLA_Options_Chain_Historical_combined.csv"
+    default_out = r"C:\My Documents\Mics\Logs\TSLA_Surface_Vector_Greeks.csv"
 
-if len(X_val_plot) > 0:
-    X_val_plot_tensor = torch.tensor(X_val_plot, dtype=torch.float32).to(device)
+    ap.add_argument("--daily", default=default_daily, help="Daily stock file")
+    ap.add_argument("--options", default=default_opts, help="Big options file")
+    ap.add_argument("--out", default=default_out, help="Output file")
 
-    with torch.no_grad():
-        predictions_normalized = best_model(X_val_plot_tensor)
+    args = ap.parse_args()
 
-    predictions_normalized = predictions_normalized.cpu().numpy()
-    predicted_prices = (predictions_normalized * price_std) + price_mean
-    actual_prices = (y_val_plot * price_std) + price_mean
+    build_surface_vectors(args.daily, args.options, args.out)
 
-    plt.figure(figsize=(15, 7))
-    plt.plot(actual_prices, label='Actual Price', color='blue', linewidth=2)
-    plt.plot(predicted_prices, label='Predicted Price', color='red', linestyle='--', linewidth=2)
-    plt.title('Best BiLSTM Model: Actual vs. Predicted Prices')
-    plt.xlabel('Time Step (in validation set)')
-    plt.ylabel('Stock Price (USD)')
-    plt.legend()
-    plt.grid(True)
-    plt.show()
-else:
-    print("Could not generate plot because the validation set was too small for the best sequence length.")
+
+if __name__ == "__main__":
+    main()

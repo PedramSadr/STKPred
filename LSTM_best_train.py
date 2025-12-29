@@ -6,6 +6,10 @@ import matplotlib.pyplot as plt
 import random
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.model_selection import train_test_split
+import os
+
+# Default input directory
+DEFAULT_INPUT_DIR = r"C:\My Documents\Mics\Logs"
 
 #
 #This Code Trains an LSTM Model on TSLA Stock Data with Predefined Hyperparameters
@@ -22,7 +26,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 # Load and preprocess data
-csv_path = r'C:\My Documents\Mics\Logs\tsla_daily.csv'
+csv_path = os.path.join(DEFAULT_INPUT_DIR, 'tsla_daily.csv')
 df = pd.read_csv(csv_path)
 df.columns = df.columns.str.strip().str.lower()
 df = df.dropna()
@@ -147,7 +151,7 @@ for epoch in range(epochs):
         print(f"Epoch {epoch+1}, Train Loss: {loss.item():.6f}, Val Loss: {val_loss:.6f}")
 
 print(f"Best validation loss: {best_val_loss:.6f}")
-torch.save(best_model_state, r'C:\My Documents\Mics\Logs\tsla_lstm_model_best.pth')
+torch.save(best_model_state, os.path.join(DEFAULT_INPUT_DIR, 'tsla_lstm_model_best.pth'))
 
 # Plot losses
 plt.figure(figsize=(10, 5))
