@@ -15,6 +15,9 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BASE_DIR = r"C:\My Documents\Mics\Logs"
 INPUT_CSV = os.path.join(BASE_DIR, "tsla_daily.csv")
 
+# UPDATE: Renamed the output model file
+MODEL_SAVE_PATH = os.path.join(BASE_DIR, "best_stock_model.pth")
+
 os.makedirs(BASE_DIR, exist_ok=True)
 
 
@@ -22,7 +25,6 @@ os.makedirs(BASE_DIR, exist_ok=True)
 # 1. Data Preparation (Leakage Free)
 # ============================================================
 def create_sequences(X_data, y_data, seq_len):
-    """Helper to convert flat arrays into LSTM sequences."""
     X, y = [], []
     for i in range(len(X_data) - seq_len):
         X.append(X_data[i: i + seq_len])
@@ -49,25 +51,22 @@ def prepare_data(csv_path, seq_len=30, horizon=10, val_split=0.2):
     feature_cols = ["Open", "High", "Low", "Close", "Volume", "RSI", "VWAP",
                     "SMA_25", "SMA_50", "SMA_200", "MACD_12_26_9", "VIX", "SPY", "DXY"]
 
-    # 1. Split Raw Data FIRST (Chronological split)
+    # 1. Split Raw Data FIRST (Chronological)
     train_size = int(len(df) * (1 - val_split))
 
     X_raw = df[feature_cols].values
     y_raw = df[["target_mu", "target_log_sigma"]].values
 
-    X_train_raw = X_raw[:train_size]
-    X_val_raw = X_raw[train_size:]
-    y_train_raw = y_raw[:train_size]
-    y_val_raw = y_raw[train_size:]
+    X_train_raw, X_val_raw = X_raw[:train_size], X_raw[train_size:]
+    y_train_raw, y_val_raw = y_raw[:train_size], y_raw[train_size:]
 
-    # 2. Fit Scalers ONLY on Training Data
+    # 2. Fit Scalers on Train ONLY
     scaler_x = MinMaxScaler()
     scaler_y = MinMaxScaler()
 
     X_train_scaled = scaler_x.fit_transform(X_train_raw)
     y_train_scaled = scaler_y.fit_transform(y_train_raw)
 
-    # Transform Validation using Train statistics
     X_val_scaled = scaler_x.transform(X_val_raw)
     y_val_scaled = scaler_y.transform(y_val_raw)
 
@@ -79,14 +78,13 @@ def prepare_data(csv_path, seq_len=30, horizon=10, val_split=0.2):
 
 
 # ============================================================
-# 2. Model (Fixed Dropout Warning)
+# 2. Model
 # ============================================================
 class StockBiLSTM(nn.Module):
     def __init__(self, input_dim, hidden_dim, num_layers, dropout):
         super().__init__()
 
-        # FIX: PyTorch LSTM ignores dropout if num_layers=1 and throws a warning.
-        # We force dropout=0 in that specific case.
+        # FIX: Handle dropout warning for single layer LSTM
         lstm_dropout = dropout if num_layers > 1 else 0.0
 
         self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers,
@@ -122,9 +120,8 @@ def objective(trial):
             xb, yb = xb.to(DEVICE), yb.to(DEVICE)
             mu, sigma = model(xb)
             loss = criterion(mu, yb[:, 0:1]) + 0.5 * criterion(sigma, yb[:, 1:2])
-
-            optimizer.zero_grad()
-            loss.backward()
+            optimizer.zero_grad();
+            loss.backward();
             optimizer.step()
 
         model.eval()
@@ -133,11 +130,9 @@ def objective(trial):
             for xb, yb in val_loader:
                 xb, yb = xb.to(DEVICE), yb.to(DEVICE)
                 mu, sigma = model(xb)
-                loss = criterion(mu, yb[:, 0:1]) + 0.5 * criterion(sigma, yb[:, 1:2])
-                val_loss += loss.item()
+                val_loss += (criterion(mu, yb[:, 0:1]) + 0.5 * criterion(sigma, yb[:, 1:2])).item()
 
         val_loss /= len(val_loader)
-
         trial.report(val_loss, epoch)
         if trial.should_prune():
             raise optuna.exceptions.TrialPruned()
@@ -150,24 +145,61 @@ def objective(trial):
 # ============================================================
 if __name__ == "__main__":
     try:
-        print(f"Checking for data in: {BASE_DIR}")
+        print(f"Loading Data from {INPUT_CSV}...")
         X_train, y_train, X_val, y_val, scaler_y, INPUT_DIM = prepare_data(INPUT_CSV)
 
         train_loader = DataLoader(TensorDataset(X_train, y_train), batch_size=64, shuffle=False)
         val_loader = DataLoader(TensorDataset(X_val, y_val), batch_size=64, shuffle=False)
 
-        print("Starting Optuna Hyperparameter Tuning...")
+        print("Starting Optuna Tuning...")
         study = optuna.create_study(direction="minimize")
-        study.optimize(objective, n_trials=15)
+        study.optimize(objective, n_trials=10)
 
-        print("\n------------------------------------------------")
-        print("Study Completed.")
-        print("Best Hyperparameters:", study.best_params)
-        print("Best Validation Loss:", study.best_value)
-        print("------------------------------------------------")
+        print("\n" + "=" * 40)
+        print(f"BEST PARAMS: {study.best_params}")
+        print("=" * 40 + "\n")
 
-        with open(os.path.join(BASE_DIR, "optuna_results.txt"), "w") as f:
-            f.write(str(study.best_params))
+        # ============================================================
+        # 5. RETRAIN & SAVE BEST MODEL
+        # ============================================================
+        print("Retraining model with best parameters...")
+
+        best_params = study.best_params
+        best_model = StockBiLSTM(
+            input_dim=INPUT_DIM,
+            hidden_dim=best_params["hidden_dim"],
+            num_layers=best_params["num_layers"],
+            dropout=best_params["dropout"]
+        ).to(DEVICE)
+
+        optimizer = optim.Adam(best_model.parameters(), lr=best_params["lr"])
+        criterion = nn.MSELoss()
+
+        for epoch in range(20):
+            best_model.train()
+            train_loss = 0.0
+            for xb, yb in train_loader:
+                xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+                mu, sigma = best_model(xb)
+                loss = criterion(mu, yb[:, 0:1]) + 0.5 * criterion(sigma, yb[:, 1:2])
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                train_loss += loss.item()
+
+            if (epoch + 1) % 5 == 0:
+                print(f"Retrain Epoch {epoch + 1}/20 | Loss: {train_loss / len(train_loader):.4f}")
+
+        # Save Final Model
+        torch.save({
+            "model_state": best_model.state_dict(),
+            "scaler_y": scaler_y,
+            "params": best_params,
+            "input_dim": INPUT_DIM
+        }, MODEL_SAVE_PATH)
+
+        print(f"\nSUCCESS: Best model saved to:\n{MODEL_SAVE_PATH}")
 
     except Exception as e:
         print(f"\nERROR: {e}")
