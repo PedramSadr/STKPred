@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -7,142 +8,166 @@ import numpy as np
 from sklearn.preprocessing import MinMaxScaler
 import optuna
 
+# -----------------------
+# Config & Paths
+# -----------------------
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+BASE_DIR = r"C:\My Documents\Mics\Logs"
+INPUT_CSV = os.path.join(BASE_DIR, "tsla_daily.csv")
 
-# --- 1. Data Preparation based on Blueprint ---
-def prepare_data(csv_path, seq_length=30, forecast_horizon=10):
-    df = pd.read_csv(csv_path)
+os.makedirs(BASE_DIR, exist_ok=True)
 
-    # Fill missing values if any
-    df = df.ffill().bfill()
 
-    # Calculate Daily Log Returns for Volatility Calculation
-    df['log_ret'] = np.log(df['Close'] / df['Close'].shift(1))
+# ============================================================
+# 1. Data Preparation (Leakage Free)
+# ============================================================
+def create_sequences(X_data, y_data, seq_len):
+    """Helper to convert flat arrays into LSTM sequences."""
+    X, y = [], []
+    for i in range(len(X_data) - seq_len):
+        X.append(X_data[i: i + seq_len])
+        y.append(y_data[i + seq_len])
+    return torch.tensor(np.array(X), dtype=torch.float32), \
+        torch.tensor(np.array(y), dtype=torch.float32)
 
-    # --- Blueprint Targets ---
-    # 1. mu (Expected 2-week log return)
-    df['target_mu'] = np.log(df['Close'].shift(-forecast_horizon) / df['Close'])
 
-    # 2. sigma (Expected 2-week realized volatility)
-    # Std dev of daily returns over the next 10 days
-    indexer = pd.api.indexers.FixedForwardWindowIndexer(window_size=forecast_horizon)
-    df['target_sigma'] = df['log_ret'].rolling(window=indexer).std()
+def prepare_data(csv_path, seq_len=30, horizon=10, val_split=0.2):
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"File not found: {csv_path}\nPlease move 'tsla_daily.csv' to {BASE_DIR}")
 
-    # Drop NaNs created by shifting/rolling
+    df = pd.read_csv(csv_path).ffill().bfill()
+
+    # Feature Engineering
+    df["log_ret"] = np.log(df["Close"] / df["Close"].shift(1))
+    df["target_mu"] = np.log(df["Close"].shift(-horizon) / df["Close"])
+
+    indexer = pd.api.indexers.FixedForwardWindowIndexer(window_size=horizon)
+    df["target_sigma"] = df["log_ret"].rolling(window=indexer).std()
+    df["target_log_sigma"] = np.log(df["target_sigma"] + 1e-6)
     df.dropna(inplace=True)
 
-    # Features (Technical Indicators + Macro from CSV)
-    feature_cols = ['Open', 'High', 'Low', 'Close', 'Volume', 'RSI', 'VWAP',
-                    'SMA_25', 'SMA_50', 'SMA_200', 'VIX', 'DXY', 'SPY', 'MACD_12_26_9']
+    feature_cols = ["Open", "High", "Low", "Close", "Volume", "RSI", "VWAP",
+                    "SMA_25", "SMA_50", "SMA_200", "MACD_12_26_9", "VIX", "SPY", "DXY"]
 
-    # Scaling
+    # 1. Split Raw Data FIRST (Chronological split)
+    train_size = int(len(df) * (1 - val_split))
+
+    X_raw = df[feature_cols].values
+    y_raw = df[["target_mu", "target_log_sigma"]].values
+
+    X_train_raw = X_raw[:train_size]
+    X_val_raw = X_raw[train_size:]
+    y_train_raw = y_raw[:train_size]
+    y_val_raw = y_raw[train_size:]
+
+    # 2. Fit Scalers ONLY on Training Data
     scaler_x = MinMaxScaler()
-    scaler_y = MinMaxScaler()  # Scale targets to help convergence
+    scaler_y = MinMaxScaler()
 
-    X_data = scaler_x.fit_transform(df[feature_cols].values)
-    y_data = scaler_y.fit_transform(df[['target_mu', 'target_sigma']].values)
+    X_train_scaled = scaler_x.fit_transform(X_train_raw)
+    y_train_scaled = scaler_y.fit_transform(y_train_raw)
 
-    # Create Sequences
-    X, y = [], []
-    for i in range(len(X_data) - seq_length):
-        X.append(X_data[i: i + seq_length])
-        y.append(y_data[i + seq_length])
+    # Transform Validation using Train statistics
+    X_val_scaled = scaler_x.transform(X_val_raw)
+    y_val_scaled = scaler_y.transform(y_val_raw)
 
-    return np.array(X), np.array(y), scaler_y, len(feature_cols)
+    # 3. Create Sequences
+    X_train, y_train = create_sequences(X_train_scaled, y_train_scaled, seq_len)
+    X_val, y_val = create_sequences(X_val_scaled, y_val_scaled, seq_len)
+
+    return X_train, y_train, X_val, y_val, scaler_y, len(feature_cols)
 
 
-# --- 2. Model Architecture (Blueprint: Stock LSTM) ---
-class BiLSTM_DualHead(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, dropout):
-        super(BiLSTM_DualHead, self).__init__()
+# ============================================================
+# 2. Model (Fixed Dropout Warning)
+# ============================================================
+class StockBiLSTM(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_layers, dropout):
+        super().__init__()
 
-        # Bi-Directional LSTM for "Learned embedding representing price regime"
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers,
-                            batch_first=True, bidirectional=True, dropout=dropout)
+        # FIX: PyTorch LSTM ignores dropout if num_layers=1 and throws a warning.
+        # We force dropout=0 in that specific case.
+        lstm_dropout = dropout if num_layers > 1 else 0.0
 
-        # Head 1: Directional Signal (mu)
-        self.head_mu = nn.Sequential(
-            nn.Linear(hidden_size * 2, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1)
-        )
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers,
+                            batch_first=True, bidirectional=True, dropout=lstm_dropout)
 
-        # Head 2: Volatility Signal (sigma)
-        self.head_sigma = nn.Sequential(
-            nn.Linear(hidden_size * 2, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1),
-            nn.Softplus()  # Volatility must be positive
-        )
+        self.proj = nn.Linear(hidden_dim * 4, hidden_dim)
+        self.mu_head = nn.Linear(hidden_dim, 1)
+        self.sigma_head = nn.Linear(hidden_dim, 1)
 
     def forward(self, x):
-        # x shape: (batch, seq_len, input_size)
         out, _ = self.lstm(x)
-
-        # Use the last hidden state as the "Regime Embedding"
-        embedding = out[:, -1, :]
-
-        mu = self.head_mu(embedding)
-        sigma = self.head_sigma(embedding)
-
-        return mu, sigma
+        embed = torch.cat([out[:, -1, :], out.mean(dim=1)], dim=1)
+        z = torch.relu(self.proj(embed))
+        return self.mu_head(z), self.sigma_head(z)
 
 
-# --- 3. Optuna Objective Function ---
+# ============================================================
+# 3. Optuna Objective
+# ============================================================
 def objective(trial):
-    # Hyperparameters to tune
-    hidden_size = trial.suggest_int('hidden_size', 32, 128)
-    num_layers = trial.suggest_int('num_layers', 1, 3)
-    dropout = trial.suggest_float('dropout', 0.1, 0.5)
-    lr = trial.suggest_float('lr', 1e-4, 1e-2, log=True)
-    batch_size = trial.suggest_categorical('batch_size', [16, 32, 64])
+    hidden_dim = trial.suggest_int("hidden_dim", 32, 128, step=16)
+    num_layers = trial.suggest_int("num_layers", 1, 3)
+    dropout = trial.suggest_float("dropout", 0.1, 0.5)
+    lr = trial.suggest_float("lr", 1e-4, 1e-2, log=True)
 
-    # Load Data
-    X, y, _, input_dim = prepare_data('tsla_daily.csv')
-
-    # Train/Val Split (Time-series split: no shuffling)
-    train_size = int(len(X) * 0.8)
-    X_train, X_val = torch.FloatTensor(X[:train_size]), torch.FloatTensor(X[train_size:])
-    y_train, y_val = torch.FloatTensor(y[:train_size]), torch.FloatTensor(y[train_size:])
-
-    train_loader = DataLoader(TensorDataset(X_train, y_train), batch_size=batch_size, shuffle=False)
-    val_loader = DataLoader(TensorDataset(X_val, y_val), batch_size=batch_size, shuffle=False)
-
-    # Model Setup
-    model = BiLSTM_DualHead(input_dim, hidden_size, num_layers, dropout)
+    model = StockBiLSTM(INPUT_DIM, hidden_dim, num_layers, dropout).to(DEVICE)
     optimizer = optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.MSELoss()  # Using MSE for regression of both targets
+    criterion = nn.MSELoss()
 
-    # Training Loop (Short epoch count for tuning speed)
-    model.train()
     for epoch in range(5):
-        for X_batch, y_batch in train_loader:
+        model.train()
+        for xb, yb in train_loader:
+            xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+            mu, sigma = model(xb)
+            loss = criterion(mu, yb[:, 0:1]) + 0.5 * criterion(sigma, yb[:, 1:2])
+
             optimizer.zero_grad()
-            mu_pred, sigma_pred = model(X_batch)
-
-            # Combined Loss: Minimize error for both Return (0) and Volatility (1)
-            loss = criterion(mu_pred, y_batch[:, 0:1]) + criterion(sigma_pred, y_batch[:, 1:2])
-
             loss.backward()
             optimizer.step()
 
-    # Validation
-    model.eval()
-    val_loss = 0.0
-    with torch.no_grad():
-        for X_batch, y_batch in val_loader:
-            mu_pred, sigma_pred = model(X_batch)
-            loss = criterion(mu_pred, y_batch[:, 0:1]) + criterion(sigma_pred, y_batch[:, 1:2])
-            val_loss += loss.item()
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+                mu, sigma = model(xb)
+                loss = criterion(mu, yb[:, 0:1]) + 0.5 * criterion(sigma, yb[:, 1:2])
+                val_loss += loss.item()
 
-    return val_loss / len(val_loader)
+        val_loss /= len(val_loader)
+
+        trial.report(val_loss, epoch)
+        if trial.should_prune():
+            raise optuna.exceptions.TrialPruned()
+
+    return val_loss
 
 
-# --- 4. Execution ---
+# ============================================================
+# 4. Main Execution
+# ============================================================
 if __name__ == "__main__":
-    # Create study and optimize
-    study = optuna.create_study(direction='minimize')
-    study.optimize(objective, n_trials=10)  # Set n_trials higher for real training
+    try:
+        print(f"Checking for data in: {BASE_DIR}")
+        X_train, y_train, X_val, y_val, scaler_y, INPUT_DIM = prepare_data(INPUT_CSV)
 
-    print("Best Hyperparameters:", study.best_params)
+        train_loader = DataLoader(TensorDataset(X_train, y_train), batch_size=64, shuffle=False)
+        val_loader = DataLoader(TensorDataset(X_val, y_val), batch_size=64, shuffle=False)
 
-    # (Optional) Re-train best model here using study.best_params
+        print("Starting Optuna Hyperparameter Tuning...")
+        study = optuna.create_study(direction="minimize")
+        study.optimize(objective, n_trials=15)
+
+        print("\n------------------------------------------------")
+        print("Study Completed.")
+        print("Best Hyperparameters:", study.best_params)
+        print("Best Validation Loss:", study.best_value)
+        print("------------------------------------------------")
+
+        with open(os.path.join(BASE_DIR, "optuna_results.txt"), "w") as f:
+            f.write(str(study.best_params))
+
+    except Exception as e:
+        print(f"\nERROR: {e}")
