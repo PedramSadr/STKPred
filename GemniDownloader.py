@@ -1,3 +1,5 @@
+from datetime import date
+
 import yfinance as yf
 import pandas as pd
 import pandas_ta as ta
@@ -131,7 +133,7 @@ if __name__ == '__main__':
     # --- Step 1: Define parameters ---
     ticker = 'TSLA'
     start_date = '2010-01-01'
-    end_date = '2025-09-22'
+    end_date = date.today().isoformat()
 
     # --- Step 2: Get the main stock data with indicators ---
     df_with_indicators = get_stock_data_with_indicators(ticker, start_date, end_date)
