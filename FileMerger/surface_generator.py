@@ -87,32 +87,42 @@ def build_surface_vectors(daily_path: str, options_path: str, surf_out_path: str
     else:
         df_opts["type"] = df_opts["type"].astype(str).str.strip().str.lower()
 
-    # Fill Missing Columns
-    for c in ["delta", "gamma", "vega", "open_interest", "implied_volatility"]:
+    # FIX A: Do NOT zero-fill IV. Handle it separately.
+    for c in ["delta", "gamma", "vega", "open_interest"]:
         if c not in df_opts.columns: df_opts[c] = 0.0
         df_opts[c] = pd.to_numeric(df_opts[c], errors="coerce").fillna(0.0)
 
+    # IV Handling: preserve NaN if missing/invalid
+    if "implied_volatility" in df_opts.columns:
+        df_opts["implied_volatility"] = pd.to_numeric(df_opts["implied_volatility"], errors="coerce")
+    else:
+        df_opts["implied_volatility"] = np.nan
+
     # =========================================================
-    # 3. GENERATE MENU (Logic extracted from Menu.py)
+    # 3. GENERATE MENU
     # =========================================================
     print(f"3. Generating Options Menu -> {menu_out_path}")
 
-    # Calculate Moneyness (Strike / Spot)
-    # < 1.0 = OTM Call / ITM Put
-    # > 1.0 = ITM Call / OTM Put
+    # Calculate Moneyness
     df_opts['moneyness'] = df_opts['strike'] / df_opts['underlying_price']
 
-    # Standardize Option Price Column
-    if 'last' in df_opts.columns:
-        df_opts['opt_price'] = df_opts['last']
-    elif 'close' in df_opts.columns:
-        df_opts['opt_price'] = df_opts['close']
-    else:
+    # FIX: IMPROVED PRICING LOGIC (Mark > Mid > Last)
+    if 'mark' in df_opts.columns:
+        df_opts['opt_price'] = df_opts['mark']
+    elif 'bid' in df_opts.columns and 'ask' in df_opts.columns:
         df_opts['opt_price'] = (df_opts['bid'] + df_opts['ask']) / 2
+    elif 'last' in df_opts.columns:
+        df_opts['opt_price'] = df_opts['last']
+    else:
+        df_opts['opt_price'] = np.nan
 
-    # Select Columns for the Menu
-    contract_cols = ['date', 'expiration', 'dte', 'type', 'strike', 'moneyness', 'opt_price',
-                     'bid', 'ask', 'volume', 'open_interest', 'delta', 'gamma', 'vega', 'underlying_price']
+    # FIX B: Add 'implied_volatility' to export columns
+    contract_cols = [
+        'date', 'expiration', 'dte', 'type', 'strike', 'moneyness', 'opt_price',
+        'bid', 'ask', 'volume', 'open_interest',
+        'implied_volatility',  # <--- Export IV
+        'delta', 'gamma', 'vega', 'underlying_price'
+    ]
     final_cols = [c for c in contract_cols if c in df_opts.columns]
 
     # Save the Menu
@@ -122,11 +132,8 @@ def build_surface_vectors(daily_path: str, options_path: str, surf_out_path: str
     # 4. CALCULATE PHYSICS (GEX/DEX/VEX)
     # =========================================================
     print("4. Calculating Physics for Surface...")
-    # DEX ($ delta)
     df_opts["dex"] = df_opts["delta"] * df_opts["open_interest"] * CONTRACT_MULTIPLIER * df_opts["underlying_price"]
-    # VEX ($ vega)
     df_opts["vex"] = df_opts["vega"] * df_opts["open_interest"] * CONTRACT_MULTIPLIER
-    # GEX ($ gamma per 1%)
     df_opts["gex"] = df_opts["gamma"] * df_opts["open_interest"] * CONTRACT_MULTIPLIER * (
                 df_opts["underlying_price"] ** 2)
 
@@ -141,9 +148,7 @@ def build_surface_vectors(daily_path: str, options_path: str, surf_out_path: str
     ),
     curves AS (
         SELECT date, dte,
-            -- ATM IV (Delta 0.40-0.60)
             AVG(CASE WHEN ABS(delta) BETWEEN 0.40 AND 0.60 THEN implied_volatility END) AS atm_iv,
-            -- Skew (Put IV - Call IV at 25 Delta)
             AVG(CASE WHEN type='put' AND ABS(delta) BETWEEN 0.20 AND 0.30 THEN implied_volatility END) -
             AVG(CASE WHEN type='call' AND ABS(delta) BETWEEN 0.20 AND 0.30 THEN implied_volatility END) AS skew_25d
         FROM base GROUP BY date, dte
@@ -165,12 +170,12 @@ def build_surface_vectors(daily_path: str, options_path: str, surf_out_path: str
     for day, day_curve in df_curve.groupby("date"):
         vec = {"trade_date": day}
 
-        # --- PHYSICS (Greeks) ---
+        # --- PHYSICS ---
         vec["net_gamma_exposure"] = float(day_curve["total_gex"].max())
         vec["net_delta_exposure"] = float(day_curve["total_dex"].max())
         vec["net_vega_exposure"] = float(day_curve["total_vex"].max())
 
-        # --- SURFACE (IV & Skew) ---
+        # --- SURFACE ---
         vec["atm_iv_14d"] = interpolate_linear(day_curve, 14, "atm_iv")
         vec["skew_25d_14d"] = interpolate_linear(day_curve, 14, "skew_25d")
 
@@ -179,7 +184,7 @@ def build_surface_vectors(daily_path: str, options_path: str, surf_out_path: str
         iv90 = interpolate_linear(day_curve, 90, "atm_iv")
         vec["term_structure_30_90"] = iv30 - iv90
 
-        # --- MACRO CONTEXT ---
+        # --- MACRO ---
         vix_val = vix_map.get(day, np.nan)
         spy_val = spy_map.get(day, np.nan)
         tsla_val = price_map.get(day, np.nan)
@@ -190,15 +195,11 @@ def build_surface_vectors(daily_path: str, options_path: str, surf_out_path: str
         vec["spy_close"] = spy_val if pd.notna(spy_val) else 0.0
         vec["dxy_close"] = dxy_map.get(day, 0.0)
         vec["wti_close"] = wti_map.get(day, 0.0)
-
-        # Beta Ratio
         vec["tsla_spy_ratio"] = (tsla_val / spy_val) if (pd.notna(spy_val) and spy_val > 0) else 0.0
 
         surface_rows.append(vec)
 
     df_out = pd.DataFrame(surface_rows).sort_values("trade_date").fillna(0.0)
-
-    # Calc Daily Changes
     df_out['iv_change_1d'] = df_out['atm_iv_14d'].diff().fillna(0)
 
     df_out.to_csv(surf_out_path, index=False)
@@ -208,7 +209,6 @@ def build_surface_vectors(daily_path: str, options_path: str, surf_out_path: str
 
 def main():
     ap = argparse.ArgumentParser()
-    # HARDCODED DEFAULTS
     base_dir = r"C:\My Documents\Mics\Logs"
     ap.add_argument("--daily", default=os.path.join(base_dir, "tsla_daily.csv"))
     ap.add_argument("--options", default=os.path.join(base_dir, "TSLA_Options_Chain_Historical_combined.csv"))
