@@ -6,32 +6,48 @@ import numpy as np
 import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_squared_error, r2_score
-import os
 import copy
 
 # --- Configuration ---
 FILE_PATH = r"C:\My Documents\Mics\Logs\TSLA_Surface_Vector_Merged.csv"
-SAVE_PATH = r"C:\My Documents\Mics\Logs\Final_TSLA_Huber_Model.pth"
-BATCH_SIZE = 300
+SAVE_PATH = r"C:\My Documents\Mics\Logs\Final_TSLA_Quantile_Model.pth"
+BATCH_SIZE = 128
 EPOCHS = 300
 PATIENCE = 30
+LR = 0.001
 
-# Optimal Params
+# Architecture Params
 SEQ_LENGTH = 3
-HIDDEN_SIZE = 32
-NUM_LAYERS = 1
-LEARNING_RATE = 0.0001
+HIDDEN_SIZE = 64
+NUM_LAYERS = 2
+QUANTILES = [0.1, 0.5, 0.9]  # P10, P50 (Median), P90
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-class BiLSTM(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, output_size=1):
-        super(BiLSTM, self).__init__()
+# --- Custom Quantile Loss ---
+class QuantileLoss(nn.Module):
+    def __init__(self, quantiles):
+        super().__init__()
+        self.quantiles = quantiles
+
+    def forward(self, preds, target):
+        loss = 0
+        for i, q in enumerate(self.quantiles):
+            errors = target - preds[:, i:i + 1]
+            loss += torch.max((q - 1) * errors, q * errors).mean()
+        return loss
+
+
+# --- Model Architecture ---
+class QuantileBiLSTM(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, num_quantiles):
+        super(QuantileBiLSTM, self).__init__()
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers,
-                            batch_first=True, bidirectional=True)
-        self.fc = nn.Linear(hidden_size * 2, output_size)
+                            batch_first=True, bidirectional=True, dropout=0.2)
+
+        # We predict 'num_quantiles' values instead of just 1
+        self.fc = nn.Linear(hidden_size * 2, num_quantiles)
 
     def forward(self, x):
         out, _ = self.lstm(x)
@@ -49,6 +65,7 @@ def train_and_verify():
     data_scaled = scaler.fit_transform(data)
 
     X, y = [], []
+    # Target is still index -1 (iv_change_1d)
     target_col_idx = -1
 
     for i in range(len(data_scaled) - SEQ_LENGTH):
@@ -66,95 +83,72 @@ def train_and_verify():
     train_loader = DataLoader(TensorDataset(X_train, y_train), batch_size=BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(TensorDataset(X_val, y_val), batch_size=BATCH_SIZE)
 
-    print(f"Training Started with Huber Loss...")
+    print(f"Training Quantile Regression Model...")
 
-    model = BiLSTM(X.shape[2], HIDDEN_SIZE, NUM_LAYERS).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-
-    # --- CHANGED: Using Huber Loss (delta=1.0 is standard) ---
-    criterion = nn.HuberLoss(delta=1.0)
-
-    # Scheduler
+    model = QuantileBiLSTM(X.shape[2], HIDDEN_SIZE, NUM_LAYERS, len(QUANTILES)).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=LR)
+    criterion = QuantileLoss(QUANTILES)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
 
     best_loss = float('inf')
     best_model_wts = copy.deepcopy(model.state_dict())
-    no_improve_count = 0
-    best_epoch = 0
-
-    loss_history = []
+    no_improve = 0
 
     for epoch in range(EPOCHS):
         model.train()
-        train_loss = 0
         for xb, yb in train_loader:
             xb, yb = xb.to(device), yb.to(device)
             optimizer.zero_grad()
-            loss = criterion(model(xb), yb)
+            preds = model(xb)
+            loss = criterion(preds, yb)
             loss.backward()
             optimizer.step()
-            train_loss += loss.item()
 
-        # Validation phase
+        # Validation
         model.eval()
         val_loss = 0
         with torch.no_grad():
             for xb, yb in val_loader:
                 xb, yb = xb.to(device), yb.to(device)
-                # Calculate Huber Loss for validation
-                l = criterion(model(xb), yb)
-                val_loss += l.item() * xb.size(0)
+                preds = model(xb)
+                val_loss += criterion(preds, yb).item() * xb.size(0)
 
         avg_val_loss = val_loss / len(X_val)
-        loss_history.append(avg_val_loss)
-
-        # Step the scheduler
         scheduler.step(avg_val_loss)
 
-        # Save Best Model
         if avg_val_loss < best_loss:
             best_loss = avg_val_loss
             best_model_wts = copy.deepcopy(model.state_dict())
-            no_improve_count = 0
-            best_epoch = epoch
+            no_improve = 0
         else:
-            no_improve_count += 1
+            no_improve += 1
 
         if (epoch + 1) % 10 == 0:
-            print(f"Epoch [{epoch + 1}/{EPOCHS}] | Val Huber Loss: {avg_val_loss:.6f} | Best: {best_loss:.6f}")
+            print(f"Epoch {epoch + 1} | Val Quantile Loss: {avg_val_loss:.4f}")
 
-        if no_improve_count >= PATIENCE:
-            print(f"\nEarly stopping at epoch {epoch + 1}. Best model was at epoch {best_epoch + 1}.")
+        if no_improve >= PATIENCE:
+            print(f"Early stopping at epoch {epoch + 1}")
             break
 
-    # Load best weights
+    # Save Best
     model.load_state_dict(best_model_wts)
     torch.save(model.state_dict(), SAVE_PATH)
-    print(f"\nBest Model Saved to: {SAVE_PATH}")
-    print(f"Best Validation Huber Loss: {best_loss:.4f}")
+    print(f"Best Model Saved. Loss: {best_loss:.4f}")
 
-    # --- Final Verification (Calculates MSE for apples-to-apples comparison) ---
+    # --- Visualization ---
     model.eval()
     with torch.no_grad():
         preds = model(X_val.to(device)).cpu().numpy()
         actuals = y_val.numpy()
 
-    mse = mean_squared_error(actuals, preds)
-    r2 = r2_score(actuals, preds)
-
-    print("-" * 30)
-    print(f"FINAL METRICS (Verification)")
-    print("-" * 30)
-    print(f"MSE (Scaled): {mse:.4f} (Compare this to 0.752)")
-    print(f"R-Squared:    {r2:.4f}")
-    print("-" * 30)
-
+    # Plot last 100 days
     plt.figure(figsize=(12, 6))
-    plt.plot(actuals[-100:], label='Actual', color='black', alpha=0.7)
-    plt.plot(preds[-100:], label='Predicted', color='green')
-    plt.title(f"Huber Loss Training Results\nR2: {r2:.4f} | MSE: {mse:.4f}")
+    plt.plot(actuals[-100:], label='Actual', color='black')
+    plt.plot(preds[-100:, 1], label='Median Prediction', color='blue', linestyle='--')  # 50th percentile
+    plt.fill_between(range(100), preds[-100:, 0], preds[-100:, 2], color='blue', alpha=0.2,
+                     label='10th-90th Confidence')
+    plt.title("Quantile Forecast (Last 100 Days)")
     plt.legend()
-    plt.grid(True, alpha=0.3)
     plt.show()
 
 

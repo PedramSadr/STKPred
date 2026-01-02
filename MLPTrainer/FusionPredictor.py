@@ -7,7 +7,7 @@ from sklearn.preprocessing import MinMaxScaler, StandardScaler
 
 
 # ============================================================
-# 1. MODEL ARCHITECTURES (Fixed to match Checkpoints)
+# 1. MODEL ARCHITECTURES
 # ============================================================
 class StockBiLSTM(nn.Module):
     def __init__(self, input_dim, hidden_dim, num_layers, dropout):
@@ -17,8 +17,7 @@ class StockBiLSTM(nn.Module):
                             batch_first=True, bidirectional=True, dropout=lstm_dropout)
         self.proj = nn.Linear(hidden_dim * 4, hidden_dim)
 
-        # FIX: Restored these heads to match the saved checkpoint structure
-        # Even if unused for fusion, they must exist to load weights without error.
+        # HEADS (Required to match saved state_dict keys)
         self.mu_head = nn.Linear(hidden_dim, 1)
         self.sigma_head = nn.Linear(hidden_dim, 1)
 
@@ -84,7 +83,7 @@ class FusionPredictor:
         self.seq_len_option = 3
         self.predict_horizon = 10
 
-        # Load Data & Fit Scalers (Replicating Training Logic)
+        # Load Data & Fit Scalers
         self._load_and_prepare_data()
 
         # Load Models
@@ -155,8 +154,6 @@ class FusionPredictor:
         self.scaler_market.fit(market_data)
 
     def _load_models(self):
-        # FIX: weights_only=False allows loading scalars/dicts safely if you trust the file
-
         # 1. Stock Model
         ckpt_s = torch.load(self.stock_model_path, map_location=self.device, weights_only=False)
         self.model_s = StockBiLSTM(ckpt_s["input_dim"], ckpt_s["params"]["hidden_dim"],
@@ -234,11 +231,14 @@ class FusionPredictor:
         annual_factor = 252.0 / self.predict_horizon
         mu_annual = raw_mu_10d * annual_factor
         sigma_annual = raw_vol_10d * np.sqrt(252)
-        aiv_val = raw_aiv_10d
+
+        # SAFETY GUARDRAILS (Clip Drift to avoid crazy values)
+        mu_annual = float(np.clip(mu_annual, -0.8, 0.8))
+        sigma_annual = float(max(sigma_annual, 0.05))
 
         return {
-            "mu": float(mu_annual),
-            "sigma": float(sigma_annual),
-            "aiv": float(aiv_val),
+            "mu": mu_annual,
+            "sigma": sigma_annual,
+            "aiv": float(raw_aiv_10d),
             "raw_mu_10d": float(raw_mu_10d)
         }

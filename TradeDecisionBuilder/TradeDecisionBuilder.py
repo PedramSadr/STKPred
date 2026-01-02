@@ -8,9 +8,10 @@ import datetime
 class DecisionType(Enum):
     TRADE = "TRADE"
     NO_TRADE = "NO_TRADE"
+    REJECT = "REJECT"  # Alias for internal rejection logic
 
 
-# --- 2. The Immutable Trade Decision Object (Section 5) ---
+# --- 2. The Immutable Trade Decision Object ---
 @dataclass(frozen=True)
 class TradeDecision:
     """
@@ -31,11 +32,11 @@ class TradeDecision:
     gates_log: List[str] = field(default_factory=list)
 
 
-# --- 3. The Confidence Calculator (Section 6) ---
+# --- 3. The Confidence Calculator ---
 class ConfidenceCalculator:
     """
-    Deterministic score derived from normalized metrics[cite: 31].
-    Never learned or optimized[cite: 32].
+    Deterministic score derived from normalized metrics.
+    Never learned or optimized.
     """
     WEIGHT_DOWNSIDE_SHARPE = 0.50
     WEIGHT_POP = 0.30
@@ -67,7 +68,7 @@ class ConfidenceCalculator:
 class TradeDecisionBuilder:
     """
     Final decision-making component. Applies deterministic gates
-    to produce an immutable TradeDecision[cite: 3, 4].
+    to produce an immutable TradeDecision.
     """
 
     def __init__(self):
@@ -79,9 +80,9 @@ class TradeDecisionBuilder:
                        downside_sharpe: float,
                        cvar: float,
                        premium: float,
-                       volatility_consistent: bool,
-                       no_macro_events: bool,
-                       system_healthy: bool) -> TradeDecision:
+                       volatility_consistent: bool = True,
+                       no_macro_events: bool = True,
+                       system_healthy: bool = True) -> TradeDecision:
 
         gates_log = []
         metrics = {
@@ -94,47 +95,59 @@ class TradeDecisionBuilder:
 
         # --- GATING RULES (Strict Order)  ---
 
-        # 1. Expected P&L > 0 [cite: 20]
+        # 0. System Checks
+        if not system_healthy:
+            return self._reject("System Unhealthy", metrics, gates_log)
+        if not no_macro_events:
+            return self._reject("Macro Event Risk", metrics, gates_log)
+        if not volatility_consistent:
+            return self._reject("Vol Regime Mismatch", metrics, gates_log)
+
+        # 1. Expected P&L > 0
         if expected_pnl <= 0:
-            return self._reject("Expected P&L <= 0", metrics, gates_log)
+            return self._reject(f"Negative Expectancy: {expected_pnl:.2f}", metrics, gates_log)
         gates_log.append("PASS: Expected P&L > 0")
 
-        # 2. Probability of Profit >= 0.45 [cite: 21]
-        if prob_profit < 0.45:
-            return self._reject(f"PoP {prob_profit} < 0.45", metrics, gates_log)
-        gates_log.append("PASS: PoP >= 0.45")
+        # 2. Probability of Profit >= 0.40
+        if prob_profit < 0.40:
+            return self._reject(f"PoP {prob_profit:.2f} < 0.40", metrics, gates_log)
+        gates_log.append("PASS: PoP >= 0.40")
 
-        # 3. Downside Sharpe >= 0.40 [cite: 22]
-        if downside_sharpe < 0.40:
-            return self._reject(f"Downside Sharpe {downside_sharpe} < 0.40", metrics, gates_log)
-        gates_log.append("PASS: Downside Sharpe >= 0.40")
+        # 3. Downside Sharpe (Gray Zone Logic)
+        # ---------------------------------------------------------
+        TARGET_SHARPE = 0.35
+        GRAY_ZONE_FLOOR = 0.34
 
-        # 4. CVaR >= -0.65 * premium [cite: 23]
-        # Note: CVaR is usually negative (loss). We want it to be LESS negative than threshold.
-        # e.g. CVaR -60 is better than limit -65. (-60 >= -65 is True)
-        cvar_limit = -0.65 * premium
-        if cvar < cvar_limit:
-            return self._reject(f"CVaR {cvar} exceeds limit {cvar_limit}", metrics, gates_log)
+        # Explicit Aux Thresholds for Gray Zone
+        GRAY_POP_THRESH = 0.42
+        GRAY_PNL_THRESH = 4.5  # Raised to 4.5 per recommendation
+
+        if downside_sharpe < TARGET_SHARPE:
+            if downside_sharpe >= GRAY_ZONE_FLOOR:
+                # In Gray Zone: Require stronger aux metrics to compensate
+                if prob_profit < GRAY_POP_THRESH or expected_pnl < GRAY_PNL_THRESH:
+                    reason = (
+                        f"Downside Sharpe {downside_sharpe:.3f} in Gray Zone. "
+                        f"Override Failed: Needs PoP >= {GRAY_POP_THRESH} (got {prob_profit:.2f}) "
+                        f"AND PnL >= {GRAY_PNL_THRESH} (got {expected_pnl:.2f})"
+                    )
+                    return self._reject(reason, metrics, gates_log)
+                else:
+                    gates_log.append(f"PASS: Downside Sharpe {downside_sharpe:.3f} (Gray Zone Override)")
+            else:
+                # Hard Fail below floor
+                return self._reject(f"Downside Sharpe {downside_sharpe:.3f} < {GRAY_ZONE_FLOOR} (Hard Floor)", metrics,
+                                    gates_log)
+        else:
+            gates_log.append(f"PASS: Downside Sharpe {downside_sharpe:.3f} >= {TARGET_SHARPE}")
+
+        # 4. CVaR / Tail Risk Check
+        if abs(cvar) > 3.0 * premium and premium > 0:
+            return self._reject("Extreme Tail Risk (CVaR > 3x Premium)", metrics, gates_log)
         gates_log.append("PASS: CVaR Limit")
-
-        # 5. Volatility Regime Consistency [cite: 24]
-        if not volatility_consistent:
-            return self._reject("Volatility Regime Inconsistent", metrics, gates_log)
-        gates_log.append("PASS: Volatility Regime")
-
-        # 6. No Disallowed Events [cite: 25]
-        if not no_macro_events:
-            return self._reject("Macro/Earnings Event Detected", metrics, gates_log)
-        gates_log.append("PASS: No Events")
-
-        # 7. System Health [cite: 27]
-        if not system_healthy:
-            return self._reject("System Health/Drawdown Fail", metrics, gates_log)
-        gates_log.append("PASS: System Health")
 
         # --- ALL GATES PASSED ---
 
-        # Calculate Confidence only after passing gates [User Refinement 1]
         score = self.calculator.calculate(prob_profit, downside_sharpe, expected_pnl)
 
         return TradeDecision(
@@ -147,35 +160,13 @@ class TradeDecisionBuilder:
         )
 
     def _reject(self, reason: str, metrics: dict, gates_log: List[str]) -> TradeDecision:
-        """Helper to create a NO_TRADE decision immediately upon failure."""
+        """Helper to create a NO_TRADE/REJECT decision immediately upon failure."""
         gates_log.append(f"FAIL: {reason}")
         return TradeDecision(
-            decision=DecisionType.NO_TRADE,
-            confidence_score=0.0,  # Zero confidence on reject
+            decision=DecisionType.REJECT,
+            confidence_score=0.0,
             timestamp=datetime.datetime.now(),
             reason=reason,
             metrics_snapshot=metrics,
             gates_log=gates_log
         )
-
-
-# --- Example Usage ---
-if __name__ == "__main__":
-    builder = TradeDecisionBuilder()
-
-    # Scenario: A valid trade
-    decision = builder.build_decision(
-        expected_pnl=150.0,
-        prob_profit=0.68,
-        downside_sharpe=1.2,
-        cvar=-50.0,
-        premium=100.0,  # Limit would be -65.0, so -50 is safe
-        volatility_consistent=True,
-        no_macro_events=True,
-        system_healthy=True
-    )
-
-    print(f"Decision: {decision.decision}")
-    print(f"Reason: {decision.reason}")
-    print(f"Score: {decision.confidence_score}")
-    print(f"Log: {decision.gates_log}")

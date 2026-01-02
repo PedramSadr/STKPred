@@ -2,13 +2,10 @@ import argparse
 import logging
 from pathlib import Path
 import pandas as pd
-import os
 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
-
-DEFAULT_INPUT_DIR = r"C:\My Documents\Mics\Logs\AlphaVantage\TSLA_Options_Chain_Historical"
 
 
 def _read_csv_safely(path: Path) -> pd.DataFrame:
@@ -139,9 +136,9 @@ def append_csv_files(input_dir: str, output_file: str, pattern: str = "*.csv", d
 
 def _parse_args():
     p = argparse.ArgumentParser(description="Append/concatenate all CSV files in a directory into one CSV.")
-    p.add_argument('--input-dir', '-i', default=DEFAULT_INPUT_DIR,
+    p.add_argument('--input-dir', '-i', default=r"C:\My Documents\Mics\Logs\AlphaVantage\TSLA_Options_Chain_Historical",
                    help='Directory containing CSV files to append')
-    p.add_argument('--output-file', '-o', default=os.path.join(r"C:\My Documents\Mics\Logs\AlphaVantage", 'TSLA_Options_Chain_Historical_combined.csv'),
+    p.add_argument('--output-file', '-o', default=r"C:\My Documents\Mics\Logs\AlphaVantage\TSLA_Options_Chain_Historical_combined.csv",
                    help='Output CSV file path')
     p.add_argument('--pattern', default='*.csv', help='Glob pattern to match files')
     p.add_argument('--no-dedupe', dest='dedupe', action='store_false', help='Do not drop duplicate rows')
