@@ -2,7 +2,7 @@
 run_daily.py
 ============
 Daily orchestration script for the TSLA options trading system.
-UPDATED: Comprehensive Ledger (Market Data, Config, Forecasts, Skips)
+UPDATED: Smart Ranking (Composite Score)
 """
 
 import os
@@ -18,15 +18,14 @@ LOGS_DIR = r"C:\My Documents\Mics\Logs"
 CATALOG_FILE = os.path.join(LOGS_DIR, "TSLA_Options_Contracts.csv")
 LEDGER_FILE = os.path.join(LOGS_DIR, "paper_trade_ledger.csv")
 
+UNDERLYING_SYMBOL = "TSLA"
 RISK_FREE_RATE = 0.04
 NUM_MC_PATHS = 50_000
 MAX_CANDIDATES = 20
 FAIRNESS_CHECK_MODE = False
-
-# MULTI-SEED CONFIG
 BASE_SEED = 42
 N_SEEDS = 5
-MODEL_VERSION = "Fusion_v1.0"  # Version tag for the ledger
+MODEL_VERSION = "Fusion_v1.0"
 
 # ============================================================
 # 3. PATH & IMPORTS
@@ -44,7 +43,23 @@ from market_state_adapter import MarketStateAdapter
 from MonteCarloEngine import MonteCarloEngine, ExitRules
 from TradeDecisionBuilder import TradeDecisionBuilder, DecisionType
 from FusionPredictor import FusionPredictor
-from paper_helpers import run_candidate_multi_seed, append_ledger_rows, make_run_id
+from paper_helpers import run_candidate_multi_seed, append_ledger_rows, ensure_ledger_schema, make_run_id
+
+
+# ============================================================
+# HELPER: OCC SYMBOL GENERATOR
+# ============================================================
+def get_occ_symbol(underlying, expiration, op_type, strike):
+    try:
+        dt = pd.to_datetime(expiration)
+        yymmdd = dt.strftime('%y%m%d')
+        type_char = 'C' if op_type.upper() == 'CALL' else 'P'
+        strike_int = int(strike * 1000)
+        root = underlying.strip().upper()
+        return f"{root}{yymmdd}{type_char}{strike_int:08d}"
+    except Exception:
+        return f"{underlying}_{op_type}_{strike}_{expiration}"
+
 
 # ============================================================
 # MAIN EXECUTION
@@ -80,12 +95,10 @@ try:
     predictor = FusionPredictor(base_dir=LOGS_DIR)
     fusion_output = predictor.predict(str(TRADE_DATE))
 
-    # [TRACE] Capture Raw Forecasts for Ledger
     raw_mu_log = fusion_output['mu']
     raw_sigma = fusion_output['sigma']
     raw_aiv = fusion_output['aiv']
 
-    # Drift Conversion
     mu_arithmetic = raw_mu_log + 0.5 * (raw_sigma ** 2)
     fusion_output['mu'] = mu_arithmetic
 
@@ -117,35 +130,24 @@ pred_mu = fusion_output['mu']
 
 RUN_ID = make_run_id()
 all_ledger_rows = []
+accepted_trades = []
 
-# [NEW] COMPREHENSIVE LEDGER HEADERS
+# HEADERS
 ledger_headers = [
-    # Metadata
     "run_id", "timestamp", "trade_date", "row_id", "model_version",
-    # Contract Info
     "type", "strike", "dte", "expiration", "contractID",
-    # Market Data
     "S0", "IV0", "entry_price", "bid", "ask", "spread_pct", "volume", "open_interest",
-    # Forecast Trace
     "mu_log_raw", "sigma_raw", "aiv_10d", "mu_arith_adj",
-    # Config Fingerprint
     "hold_days", "mc_mode", "year_days", "iv_daily_std", "iv_min", "iv_max", "slippage",
     "tp_pct", "sl_pct", "be_pct", "be_buffer",
-    # MC Outputs (Key Metrics)
     "expected_pnl", "prob_profit", "downside_sharpe", "mc_sharpe", "VaR95", "expected_opt_price",
-    # MC Distribution Stats
+    "expected_pnl_std", "prob_profit_std", "downside_sharpe_std", "VaR95_std",
     "p10_value", "p90_value", "avg_exit_day",
-    # Exit Diagnostics
     "TP_rate", "SL_rate", "BE_rate", "Hold_rate",
-    # Decision
     "decision", "reason", "seed_type", "seed_val"
 ]
 
-if not os.path.exists(LEDGER_FILE):
-    with open(LEDGER_FILE, 'w', newline='') as f:
-        import csv
-
-        csv.writer(f).writerow(ledger_headers)
+ensure_ledger_schema(LEDGER_FILE, ledger_headers)
 
 for idx, candidate in enumerate(candidates, start=1):
     try:
@@ -160,21 +162,21 @@ for idx, candidate in enumerate(candidates, start=1):
         strike = leg['strike']
         dte = leg['dte']
         rid = leg.get('row_id', -1)
+        expiration = leg['expiration']
 
-        # [NEW] Extract Liquidity Data (Handle missing keys safely)
         bid = leg.get('bid', 0.0)
         ask = leg.get('ask', 0.0)
         vol = leg.get('volume', 0)
         oi = leg.get('open_interest', 0)
-        contract_id = leg.get('symbol', f"{cand_type}_{strike}_{dte}")
         entry_price = market_state.get('price', 0.0)
+        mid_price = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else entry_price
 
-        # Calculate Spread %
+        contract_id = get_occ_symbol(UNDERLYING_SYMBOL, expiration, cand_type, strike)
+
         spread_pct = 0.0
         if entry_price > 0:
             spread_pct = (ask - bid) / entry_price
 
-        # Prepare Base Row (Common to SKIP, SEED, AGG)
         base_row = {
             "run_id": RUN_ID,
             "timestamp": datetime.now().isoformat(),
@@ -184,7 +186,7 @@ for idx, candidate in enumerate(candidates, start=1):
             "type": cand_type,
             "strike": strike,
             "dte": dte,
-            "expiration": leg['expiration'],
+            "expiration": expiration,
             "contractID": contract_id,
             "S0": f"{market_state['S']:.2f}",
             "IV0": f"{market_state['IV']:.4f}",
@@ -192,12 +194,10 @@ for idx, candidate in enumerate(candidates, start=1):
             "bid": f"{bid:.2f}", "ask": f"{ask:.2f}",
             "spread_pct": f"{spread_pct:.4f}",
             "volume": vol, "open_interest": oi,
-            # Forecast Trace
             "mu_log_raw": f"{raw_mu_log:.4f}",
             "sigma_raw": f"{raw_sigma:.4f}",
             "aiv_10d": f"{raw_aiv:.4f}",
             "mu_arith_adj": f"{pred_mu:.4f}",
-            # Config Fingerprint
             "hold_days": exit_rules.hold_days,
             "mc_mode": "PATH" if exit_rules.use_path_exits else "TERMINAL",
             "year_days": exit_rules.year_days,
@@ -208,7 +208,7 @@ for idx, candidate in enumerate(candidates, start=1):
             "be_pct": exit_rules.be_trigger_pct, "be_buffer": exit_rules.be_exit_buffer
         }
 
-        # --- DIRECTIONAL PRE-FILTER (SKIP LOGIC) ---
+        # --- DIRECTIONAL PRE-FILTER ---
         skipped = False
         skip_reason = ""
         if not FAIRNESS_CHECK_MODE:
@@ -221,7 +221,6 @@ for idx, candidate in enumerate(candidates, start=1):
 
         if skipped:
             print(f"  [Candidate {idx}] SKIPPED ({skip_reason})")
-            # Log the SKIP
             skip_row = base_row.copy()
             skip_row.update({
                 "decision": "SKIP",
@@ -229,9 +228,9 @@ for idx, candidate in enumerate(candidates, start=1):
                 "seed_type": "N/A", "seed_val": "N/A"
             })
             all_ledger_rows.append(skip_row)
-            continue  # Skip Simulation
+            continue
 
-        # --- SIMULATION (If Not Skipped) ---
+        # --- SIMULATION ---
         per_seed_rows, agg = run_candidate_multi_seed(
             mc_engine, fusion_output, market_state,
             contract_id=contract_id,
@@ -239,30 +238,53 @@ for idx, candidate in enumerate(candidates, start=1):
             n_seeds=N_SEEDS
         )
 
-        # Sanity Check (on Aggregate)
         if entry_price > 0 and abs(agg['VaR_95_mean']) > (entry_price * 5):
             print(f"    [WARNING] Sanity Check: VaR ({agg['VaR_95_mean']:.2f}) > 5x Price")
 
-        # Decision
         decision = decision_builder.build_decision(
             expected_pnl=agg['expected_pnl_mean'],
             prob_profit=agg['prob_profit_mean'],
             downside_sharpe=agg['downside_sharpe_mean'],
             cvar=agg['VaR_95_mean'],
             premium=entry_price,
+            downside_sharpe_std=agg['downside_sharpe_std'],
             volatility_consistent=True,
             no_macro_events=True,
             system_healthy=True
         )
 
-        # Print Output
         status = "✅ ACCEPT" if decision.decision == DecisionType.TRADE else "❌ REJECT"
         pnl_share = agg['expected_pnl_mean']
-        print(
-            f"  [Candidate {idx}] {status} | {cand_type} {strike} (DTE {dte}) | P&L ${pnl_share:.2f} | D_Sharpe {agg['downside_sharpe_mean']:.3f}")
+        sharpe_mean = agg['downside_sharpe_mean']
+        sharpe_std = agg['downside_sharpe_std']
+        var95 = agg['VaR_95_mean']
+        pop = agg['prob_profit_mean']
+
+        # Professional Output
+        print(f"  [Candidate {idx}] {status} | {contract_id} | {cand_type} {strike} DTE {dte} exp {expiration}")
+        print(f"     bid/ask {bid:.2f}/{ask:.2f} mid {mid_price:.2f} | "
+              f"EV {pnl_share:.2f} | PoP {pop:.2f} | "
+              f"DS {sharpe_mean:.3f}±{sharpe_std:.3f} | VaR95 {var95:.1f}")
 
         if decision.decision != DecisionType.TRADE:
             print(f"     [REJECT REASON] {decision.reason}")
+        else:
+            # [NEW] Calculate Composite Score
+            # Score = DS_mean - 0.5 * DS_std + 0.2 * (EV / |VaR95|)
+            composite_score = sharpe_mean - (0.5 * sharpe_std)
+            if abs(var95) > 1e-6:
+                composite_score += 0.2 * (pnl_share / abs(var95))
+
+            accepted_trades.append({
+                "id": contract_id,
+                "desc": f"{cand_type} {strike} DTE {dte}",
+                "score": composite_score,
+                "ds": sharpe_mean,
+                "ds_std": sharpe_std,
+                "ev": pnl_share,
+                "pop": pop,
+                "var": var95
+            })
 
         # Add Per-Seed Rows
         for r in per_seed_rows:
@@ -298,6 +320,10 @@ for idx, candidate in enumerate(candidates, start=1):
             "VaR95": f"{agg['VaR_95_mean']:.4f}",
             "expected_opt_price": f"{agg['expected_option_price_mean']:.4f}",
             "p10_value": f"{agg['p10_value_mean']:.4f}", "p90_value": f"{agg['p90_value_mean']:.4f}",
+            "expected_pnl_std": f"{agg['expected_pnl_std']:.4f}",
+            "prob_profit_std": f"{agg['prob_profit_std']:.4f}",
+            "downside_sharpe_std": f"{agg['downside_sharpe_std']:.4f}",
+            "VaR95_std": f"{agg['VaR_95_std']:.4f}",
             "TP_rate": f"{agg.get('exit_rate_tp_mean', 0):.2f}",
             "SL_rate": f"{agg.get('exit_rate_sl_mean', 0):.2f}",
             "BE_rate": f"{agg.get('exit_rate_be_mean', 0):.2f}",
@@ -311,7 +337,26 @@ for idx, candidate in enumerate(candidates, start=1):
 
 # WRITE LEDGER BATCH
 if all_ledger_rows:
-    append_ledger_rows(LEDGER_FILE, all_ledger_rows)
+    append_ledger_rows(LEDGER_FILE, all_ledger_rows, headers=ledger_headers)
     print(f"\n[LEDGER] Saved {len(all_ledger_rows)} rows to {LEDGER_FILE}")
+
+# [NEW] SUMMARY RANKING WITH COMPOSITE SCORE
+if accepted_trades:
+    print("\n" + "=" * 80)
+    print("🏆 TOP ACCEPTED TRADES (Ranked by Composite Score)")
+    print("   Formula: Score = DS_mean - 0.5*DS_std + 0.2*(EV/|VaR|)")
+    print("=" * 80)
+    # Sort by Score descending
+    accepted_trades.sort(key=lambda x: x['score'], reverse=True)
+
+    for rank, t in enumerate(accepted_trades, start=1):
+        print(f"#{rank} {t['id']} | {t['desc']}")
+        print(f"   Score: {t['score']:.4f} | DS: {t['ds']:.3f}±{t['ds_std']:.3f} | "
+              f"EV: ${t['ev']:.2f} | VaR: {t['var']:.1f}")
+        print("-" * 80)
+else:
+    print("\n" + "=" * 80)
+    print("⚠️  NO TRADES ACCEPTED TODAY")
+    print("=" * 80)
 
 print("\nDaily orchestration complete.")

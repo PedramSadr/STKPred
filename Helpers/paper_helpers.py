@@ -1,5 +1,6 @@
 import os
 import zlib
+import time
 import numpy as np
 import pandas as pd
 from datetime import datetime
@@ -54,9 +55,52 @@ def run_candidate_multi_seed(mc_engine, fusion_output, market_state, contract_id
     return per_seed_rows, agg
 
 
-def append_ledger_rows(csv_path, rows):
+def ensure_ledger_schema(path, new_headers):
+    """
+    Checks if the existing ledger header matches new_headers.
+    If not, backs up the old file to start fresh.
+    """
+    if not os.path.exists(path):
+        return
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            existing_header_str = f.readline().strip()
+            # Handle empty file case
+            if not existing_header_str:
+                existing_headers = []
+            else:
+                existing_headers = existing_header_str.split(",")
+    except Exception as e:
+        print(f"[LEDGER] Warning: Could not read existing header: {e}")
+        existing_headers = []
+
+    # Compare lists (robust check)
+    if existing_headers != new_headers:
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        backup_path = path.replace(".csv", f"_backup_{ts}.csv")
+        try:
+            os.rename(path, backup_path)
+            print(f"\n[LEDGER] 🚨 SCHEMA MISMATCH DETECTED 🚨")
+            print(f"Old ledger renamed to: {os.path.basename(backup_path)}")
+            print(f"Starting new clean ledger with {len(new_headers)} columns.\n")
+        except OSError as e:
+            print(f"[LEDGER] Error backing up file: {e}")
+
+
+def append_ledger_rows(csv_path, rows, headers=None):
+    """
+    Appends rows to CSV.
+    Enforces schema alignment if headers are provided.
+    """
     os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+
     df_new = pd.DataFrame(rows)
+
+    # Enforce column order if provided (prevents misalignment)
+    if headers:
+        df_new = df_new.reindex(columns=headers)
+
     if os.path.exists(csv_path):
         df_new.to_csv(csv_path, mode='a', header=False, index=False)
     else:
