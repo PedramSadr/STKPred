@@ -7,6 +7,7 @@ from typing import TypedDict, List, Literal, Optional
 
 # --- CANONICAL SCHEMA DEFINITION ---
 class OptionLeg(TypedDict):
+    row_id: int         # <--- NEW: Traceability ID
     expiration: str
     strike: float
     type: Literal['call', 'put']
@@ -226,7 +227,11 @@ class CandidateGenerator:
         else:
             exp_str = str(row['expiration'])
 
+        # FIX: Capture Row ID (default to -1 if missing)
+        row_id = int(row.get('row_id', -1))
+
         return {
+            "row_id": row_id,  # <--- NEW
             "expiration": exp_str,
             "strike": float(row['strike']),
             "type": row['type'],
@@ -266,8 +271,5 @@ if __name__ == "__main__":
         latest_date = df['date'].max()
         results = gen.generate(df, trade_date=str(latest_date.date()))
         print(f"Generated {len(results)} Candidates.")
-        if results:
-            c = results[0]
-            print(f"Sample: {c['structure']} | Spot: {c['underlying_price']} | IV: {c['legs'][0]['iv']}")
     except Exception as e:
         print(f"Error: {e}")

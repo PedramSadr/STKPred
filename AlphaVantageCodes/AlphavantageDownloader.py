@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 # Alpha Vantage API URL and key (fallback)
-API_KEY = "D3738GH3ZEDDZKSB"
+API_KEY = "QR4I54YXBGUV6GQA"
 ALPHA_VANTAGE_BASE = "https://www.alphavantage.co/query"
 # Default output CSV/JSON directory and filename template
 DEFAULT_OUTPUT_DIR = r"C:\My Documents\Mics\Logs\AlphaVantage\TSLA_Options_Chain_Historical"
@@ -157,6 +157,6 @@ def download_alpha_vantage_range(from_date: str, to_date: str, output_dir: str =
 if __name__ == "__main__":
     # Example usage: download a short range. Adjust dates as needed.
     # WARNING: Downloading many days will be rate-limited by Alpha Vantage. Use Polygon for bulk historical data.
-    example_from = '2020-01-01'
-    example_to = '2020-12-31'
+    example_from = '2025-01-01'
+    example_to = '2025-12-31'
     download_alpha_vantage_range(example_from, example_to, output_dir=DEFAULT_OUTPUT_DIR, sleep_seconds=1.0)
