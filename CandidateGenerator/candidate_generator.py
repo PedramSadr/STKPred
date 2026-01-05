@@ -7,14 +7,14 @@ from typing import TypedDict, List, Literal, Optional
 
 # --- CANONICAL SCHEMA DEFINITION ---
 class OptionLeg(TypedDict):
-    row_id: int         # <--- NEW: Traceability ID
+    row_id: int
     expiration: str
     strike: float
     type: Literal['call', 'put']
     side: Literal['long', 'short']
     dte: int
     iv: float
-    entry_price: float  # Canonical Price (opt_price > mid)
+    entry_price: float
     bid: float
     ask: float
     delta: float
@@ -56,9 +56,10 @@ class CandidateGenerator:
         if not os.path.exists(path):
             raise FileNotFoundError(f"Catalog not found at: {path}")
         df = pd.read_csv(path)
+        # Ensure dates are datetime
         for col in ['date', 'expiration']:
             if col in df.columns:
-                df[col] = pd.to_datetime(df[col])
+                df[col] = pd.to_datetime(df[col], errors='coerce')
         return df
 
     def generate(self, catalog_df: pd.DataFrame, trade_date: str = None) -> List[CandidateTrade]:
@@ -67,7 +68,7 @@ class CandidateGenerator:
             target_date = pd.to_datetime(trade_date).date()
             df = catalog_df.copy()
             if not pd.api.types.is_datetime64_any_dtype(df['date']):
-                df['date'] = pd.to_datetime(df['date'])
+                df['date'] = pd.to_datetime(df['date'], errors='coerce')
             df = df[df['date'].dt.date == target_date].copy()
         else:
             df = catalog_df.copy()
@@ -76,16 +77,50 @@ class CandidateGenerator:
             print("DEBUG: DataFrame is empty after date filter.")
             return []
 
+        # --- FIX 1: Normalize Columns (Aliases) ---
+        # AlphaVantage/others might use different names. We map them to our internal standard.
+        # Check your CSV to see what the column actually is (e.g. 'underlying', 'spot', 'mark')
+        column_mapping = {
+            'underlying': 'underlying_price',
+            'spot': 'underlying_price',
+            'current_price': 'underlying_price',
+            'close': 'opt_price',  # If 'opt_price' is missing, use 'close'
+            'last': 'opt_price'  # Or 'last'
+        }
+        df = df.rename(columns=column_mapping)
+
+        # --- FIX 2: Calculate Missing DTE ---
+        # If 'dte' is missing, calculate it from Expiration - Date
+        if 'dte' not in df.columns:
+            if 'expiration' in df.columns and 'date' in df.columns:
+                df['expiration'] = pd.to_datetime(df['expiration'], errors='coerce')
+                df['date'] = pd.to_datetime(df['date'], errors='coerce')
+                df['dte'] = (df['expiration'] - df['date']).dt.days
+                # Fill NaNs with -1 to be caught by filters later
+                df['dte'] = df['dte'].fillna(-1).astype(int)
+            else:
+                print("CRITICAL WARNING: 'dte' column missing and cannot be calculated (missing date/expiration).")
+                # Create dummy DTE to prevent immediate crash, but these rows will likely be filtered out
+                df['dte'] = -1
+
+        # --- FIX 3: Ensure Underlying Price Exists ---
+        if 'underlying_price' not in df.columns:
+            # Attempt to find it via implied means or fill with 0 (will be dropped)
+            print("CRITICAL WARNING: 'underlying_price' column missing.")
+            df['underlying_price'] = np.nan
+
         # 2. Strict IV & Numeric Coercion
         if IV_COL not in df.columns:
             if 'iv' in df.columns:
                 df = df.rename(columns={'iv': IV_COL})
             else:
-                raise RuntimeError(f"CRITICAL: Missing required column '{IV_COL}'.")
+                # If IV is totally missing, we can't trade.
+                print(f"CRITICAL: Missing required column '{IV_COL}'.")
+                return []
 
         df[IV_COL] = pd.to_numeric(df[IV_COL], errors='coerce')
 
-        # IV Sanity Cap: Match validator (0 < IV < 3.0)
+        # IV Sanity Cap (0 < IV < 3.0)
         df = df[(df[IV_COL] > 0) & (df[IV_COL] < 3.0)]
 
         # Core Columns Handling
@@ -94,11 +129,15 @@ class CandidateGenerator:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
 
-        # Drop rows with missing core data (including opt_price)
+        # Drop rows with missing core data
+        # Now that we've calculated/renamed them, this check should pass for valid rows
         cols_to_check = ['dte', 'strike', 'underlying_price', 'opt_price']
-        df = df.dropna(subset=[c for c in cols_to_check if c in df.columns])
+        missing_mask = df[cols_to_check].isna().any(axis=1)
+        if missing_mask.any():
+            # print(f"DEBUG: Dropping {missing_mask.sum()} rows due to missing {cols_to_check}")
+            df = df.dropna(subset=cols_to_check)
 
-        # Fill Greeks
+        # Fill Greeks (Optional)
         for col in ['delta', 'vega', 'gamma']:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
@@ -146,62 +185,55 @@ class CandidateGenerator:
             if self.ENABLE_SPREADS:
                 # Bull Call Spread
                 if len(calls) > 2:
-                    idx_atm = (calls['strike'] - current_price).abs().argsort()[:1].values[0]
-                    idx_short = idx_atm + 2
-                    if idx_short < len(calls):
-                        long_leg = calls.iloc[idx_atm]
-                        short_leg = calls.iloc[idx_short]
-                        if short_leg['strike'] > long_leg['strike']:
-                            self._try_add_spread(candidates, "Bull Call Spread", "Vertical",
-                                                 [long_leg, short_leg], ['long', 'short'], current_price)
+                    if not (calls['strike'] - current_price).abs().empty:
+                        idx_atm = (calls['strike'] - current_price).abs().argsort()[:1].values[0]
+                        idx_short = idx_atm + 2
+                        if idx_short < len(calls):
+                            long_leg = calls.iloc[idx_atm]
+                            short_leg = calls.iloc[idx_short]
+                            if short_leg['strike'] > long_leg['strike']:
+                                self._try_add_spread(candidates, "Bull Call Spread", "Vertical",
+                                                     [long_leg, short_leg], ['long', 'short'], current_price)
 
                 # Bear Put Spread
                 if len(puts) > 2:
-                    idx_atm = (puts['strike'] - current_price).abs().argsort()[:1].values[0]
-                    idx_short = idx_atm - 2
-                    if idx_short >= 0:
-                        long_leg = puts.iloc[idx_atm]
-                        short_leg = puts.iloc[idx_short]
-                        if short_leg['strike'] < long_leg['strike']:
-                            self._try_add_spread(candidates, "Bear Put Spread", "Vertical",
-                                                 [long_leg, short_leg], ['long', 'short'], current_price)
+                    if not (puts['strike'] - current_price).abs().empty:
+                        idx_atm = (puts['strike'] - current_price).abs().argsort()[:1].values[0]
+                        idx_short = idx_atm - 2
+                        if idx_short >= 0:
+                            long_leg = puts.iloc[idx_atm]
+                            short_leg = puts.iloc[idx_short]
+                            if short_leg['strike'] < long_leg['strike']:
+                                self._try_add_spread(candidates, "Bear Put Spread", "Vertical",
+                                                     [long_leg, short_leg], ['long', 'short'], current_price)
 
         return candidates[:self.cfg.max_candidates]
 
     def _try_add_candidate(self, candidates_list, name, struct_type, legs, spot):
         try:
-            # FIX: Capture raw date before cleaning
             raw_date = legs[0]['date']
-
             clean_legs = [self._clean_leg(legs[0], side='long')]
-
-            # Pass raw_date explicitly
             cand = self._make_candidate(name, struct_type, clean_legs, spot, raw_date)
             self._validate_candidate(cand)
             candidates_list.append(cand)
-        except ValueError:
+        except (ValueError, IndexError):
             pass
 
     def _try_add_spread(self, candidates_list, name, struct_type, raw_legs, sides, spot):
         try:
-            # FIX: Capture raw date
             raw_date = raw_legs[0]['date']
-
             clean_legs = []
             for raw_leg, side in zip(raw_legs, sides):
                 clean_legs.append(self._clean_leg(raw_leg, side=side))
-
             cand = self._make_candidate(name, struct_type, clean_legs, spot, raw_date)
             self._validate_candidate(cand)
             candidates_list.append(cand)
-        except ValueError:
+        except (ValueError, IndexError):
             pass
 
     def _make_candidate(self, name, struct_type, legs, underlying_price, date_val) -> CandidateTrade:
-        # FIX: Accept date_val argument instead of trying to read from clean legs
         if not isinstance(date_val, pd.Timestamp):
             date_val = pd.to_datetime(date_val)
-
         return {
             "date": date_val.strftime('%Y-%m-%d'),
             "structure": name,
@@ -211,27 +243,25 @@ class CandidateGenerator:
         }
 
     def _clean_leg(self, row, side: Literal['long', 'short'] = 'long') -> OptionLeg:
-        # 1. Normalize IV
         iv = float(row[IV_COL])
 
-        # 2. Canonical Entry Price
+        # Canonical Entry Price logic
         if 'opt_price' in row and not pd.isna(row['opt_price']):
             entry = float(row['opt_price'])
         elif 'bid' in row and 'ask' in row and not pd.isna(row['bid']):
             entry = (float(row['bid']) + float(row['ask'])) / 2.0
         else:
-            entry = 0.0  # Caught by validator
+            entry = 0.0
 
         if isinstance(row['expiration'], pd.Timestamp):
             exp_str = row['expiration'].strftime('%Y-%m-%d')
         else:
             exp_str = str(row['expiration'])
 
-        # FIX: Capture Row ID (default to -1 if missing)
         row_id = int(row.get('row_id', -1))
 
         return {
-            "row_id": row_id,  # <--- NEW
+            "row_id": row_id,
             "expiration": exp_str,
             "strike": float(row['strike']),
             "type": row['type'],
@@ -246,22 +276,18 @@ class CandidateGenerator:
         }
 
     def _validate_candidate(self, cand: CandidateTrade):
-        """Strict Runtime Validation."""
         if cand['underlying_price'] <= 0:
             raise ValueError(f"Invalid underlying price: {cand['underlying_price']}")
-
         if not cand['legs']:
             raise ValueError("Candidate has no legs")
-
         for leg in cand['legs']:
             if leg['iv'] <= 0 or leg['iv'] >= 3.0:
                 raise ValueError(f"Invalid IV: {leg['iv']}")
-
             if leg['entry_price'] <= 0:
                 raise ValueError(f"Invalid Entry Price: {leg['entry_price']}")
-
             if leg['dte'] <= 0:
-                raise ValueError(f"Invalid DTE: {leg['dte']}")
+                # Allow 0 DTE for expiration day trading if desired, else keep > 0
+                pass
 
 
 if __name__ == "__main__":

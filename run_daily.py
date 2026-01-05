@@ -2,7 +2,7 @@
 run_daily.py
 ============
 Daily orchestration script for the TSLA options trading system.
-UPDATED: Smart Ranking (Composite Score)
+UPDATED: Robust Data Loading + Smart Ranking + Staleness Guardrails
 """
 
 import os
@@ -38,12 +38,18 @@ sys.path.append(os.path.join(PROJECT_ROOT, "TradeDecisionBuilder"))
 sys.path.append(os.path.join(PROJECT_ROOT, "MLPTrainer"))
 sys.path.append(os.path.join(PROJECT_ROOT, "Helpers"))
 
-from candidate_generator import CandidateGenerator, GeneratorConfig
-from market_state_adapter import MarketStateAdapter
-from MonteCarloEngine import MonteCarloEngine, ExitRules
-from TradeDecisionBuilder import TradeDecisionBuilder, DecisionType
-from FusionPredictor import FusionPredictor
-from paper_helpers import run_candidate_multi_seed, append_ledger_rows, ensure_ledger_schema, make_run_id
+# Import your modules (Ensure these files exist in the paths above)
+try:
+    from candidate_generator import CandidateGenerator, GeneratorConfig
+    from market_state_adapter import MarketStateAdapter
+    from MonteCarloEngine import MonteCarloEngine, ExitRules
+    from TradeDecisionBuilder import TradeDecisionBuilder, DecisionType
+    from FusionPredictor import FusionPredictor
+    from paper_helpers import run_candidate_multi_seed, append_ledger_rows, ensure_ledger_schema, make_run_id
+except ImportError as e:
+    print(f"CRITICAL IMPORT ERROR: {e}")
+    print("Ensure all helper modules (CandidateGenerator, MonteCarloEngine, etc.) are in the correct folders.")
+    sys.exit(1)
 
 
 # ============================================================
@@ -65,29 +71,77 @@ def get_occ_symbol(underlying, expiration, op_type, strike):
 # MAIN EXECUTION
 # ============================================================
 
-# 1. LOAD DATA
+# 1. LOAD DATA (ROBUST VERSION)
 print(f"\nLoading catalog from: {CATALOG_FILE}")
 if not os.path.exists(CATALOG_FILE):
     raise FileNotFoundError(f"Catalog not found: {CATALOG_FILE}")
 
-catalog = pd.read_csv(CATALOG_FILE, parse_dates=["date", "expiration"])
+# [FIX] Read with low_memory=False to avoid mixed-type warnings
+catalog = pd.read_csv(CATALOG_FILE, low_memory=False)
+
+# [FIX] Coerce dates to datetime. Bad rows (like text headers) become NaT.
+catalog["date"] = pd.to_datetime(catalog["date"], errors='coerce')
+
+# [FIX] Drop rows where date is invalid (NaT). This removes the corrupted lines.
+catalog = catalog.dropna(subset=['date'])
+
+# [FIX] Convert to pure date objects for comparison
 catalog["date"] = catalog["date"].dt.date
+
+# [FIX] Clean expiration column too if it exists
+if "expiration" in catalog.columns:
+    catalog["expiration"] = pd.to_datetime(catalog["expiration"], errors='coerce')
+
 today = date.today()
-available_dates = sorted(d for d in catalog["date"].unique() if d <= today)
-if not available_dates: raise RuntimeError("No valid dates.")
+
+# [FIX] Safe filtering
+available_dates = sorted(d for d in catalog["date"].unique() if pd.notna(d) and d <= today)
+
+if not available_dates:
+    raise RuntimeError("No valid dates found in catalog.")
+
 TRADE_DATE = available_dates[-1]
+print(f"Target Trade Date Resolved: {TRADE_DATE}")
+
+# --- STALENESS CHECK ---
+days_lag = (today - TRADE_DATE).days
+if days_lag > 3:
+    print(f"\n[CRITICAL ERROR] Data is stale by {days_lag} days!")
+    print(f"  Latest available date: {TRADE_DATE}")
+    print(f"  Current system date:   {today}")
+    print("  ACTION REQUIRED: Check your data downloader or file appender.")
+    sys.exit(1)
 
 catalog_today = catalog[catalog["date"] == TRADE_DATE].copy()
 catalog_today["row_id"] = catalog_today.index
-print(f"Target Trade Date Resolved: {TRADE_DATE}")
 
 # 2. GENERATE CANDIDATES
 print(f"\nGenerating candidates...")
-gen_config = GeneratorConfig(min_dte=7, max_dte=45, max_candidates=MAX_CANDIDATES)
-generator = CandidateGenerator(gen_config)
+
+# Initialize generator (With safety check for old vs new version)
+try:
+    # Attempt to use Smart Config
+    gen_config = GeneratorConfig(
+        min_dte=7,
+        max_dte=45,
+        max_candidates=MAX_CANDIDATES,
+        min_vol=50,
+        min_oi=100,
+        # max_bid_ask_pct=0.05,  <-- These only work if you updated candidate_generator.py
+        # target_delta=0.50
+    )
+    generator = CandidateGenerator(gen_config)
+except TypeError:
+    # Fallback if your CandidateGenerator is the old version
+    print("Warning: Using Default/Old CandidateGenerator config.")
+    generator = CandidateGenerator()
+
 candidates = generator.generate(catalog_today, trade_date=str(TRADE_DATE))
 print(f"Generated {len(candidates)} candidates.")
-if not candidates: sys.exit(0)
+
+if not candidates:
+    print("No candidates met the criteria.")
+    sys.exit(0)
 
 # 3. PREDICT
 print("\nRunning Fusion Model Inference...")
@@ -260,7 +314,6 @@ for idx, candidate in enumerate(candidates, start=1):
         var95 = agg['VaR_95_mean']
         pop = agg['prob_profit_mean']
 
-        # Professional Output
         print(f"  [Candidate {idx}] {status} | {contract_id} | {cand_type} {strike} DTE {dte} exp {expiration}")
         print(f"     bid/ask {bid:.2f}/{ask:.2f} mid {mid_price:.2f} | "
               f"EV {pnl_share:.2f} | PoP {pop:.2f} | "
@@ -269,8 +322,7 @@ for idx, candidate in enumerate(candidates, start=1):
         if decision.decision != DecisionType.TRADE:
             print(f"     [REJECT REASON] {decision.reason}")
         else:
-            # [NEW] Calculate Composite Score
-            # Score = DS_mean - 0.5 * DS_std + 0.2 * (EV / |VaR95|)
+            # Composite Score Calculation
             composite_score = sharpe_mean - (0.5 * sharpe_std)
             if abs(var95) > 1e-6:
                 composite_score += 0.2 * (pnl_share / abs(var95))
@@ -340,13 +392,12 @@ if all_ledger_rows:
     append_ledger_rows(LEDGER_FILE, all_ledger_rows, headers=ledger_headers)
     print(f"\n[LEDGER] Saved {len(all_ledger_rows)} rows to {LEDGER_FILE}")
 
-# [NEW] SUMMARY RANKING WITH COMPOSITE SCORE
+# SUMMARY
 if accepted_trades:
     print("\n" + "=" * 80)
     print("🏆 TOP ACCEPTED TRADES (Ranked by Composite Score)")
     print("   Formula: Score = DS_mean - 0.5*DS_std + 0.2*(EV/|VaR|)")
     print("=" * 80)
-    # Sort by Score descending
     accepted_trades.sort(key=lambda x: x['score'], reverse=True)
 
     for rank, t in enumerate(accepted_trades, start=1):
