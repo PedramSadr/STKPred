@@ -2,7 +2,7 @@
 run_daily.py
 ============
 Daily orchestration script for the TSLA options trading system.
-UPDATED: Auto-fetch Underlying Price (yfinance) + Robust Loading
+UPDATED: Symbols set to CUSTOM format (TSLA260213P445.0) for compatibility.
 """
 
 import os
@@ -10,7 +10,7 @@ import sys
 from datetime import datetime, date, timedelta
 import pandas as pd
 import numpy as np
-import yfinance as yf  # <--- NEW DEPENDENCY
+import yfinance as yf
 
 # ============================================================
 # 2. CONFIGURATION
@@ -52,17 +52,25 @@ except ImportError as e:
 
 
 # ============================================================
-# HELPER: OCC SYMBOL GENERATOR
+# HELPER: CUSTOM SYMBOL GENERATOR
 # ============================================================
 def get_occ_symbol(underlying, expiration, op_type, strike):
+    """
+    Generates CUSTOM Symbol Format: Root + YYMMDD + Type + Strike(float string)
+    Example: TSLA260213P445.0
+    """
     try:
         dt = pd.to_datetime(expiration)
         yymmdd = dt.strftime('%y%m%d')
         type_char = 'C' if op_type.upper() == 'CALL' else 'P'
-        strike_int = int(strike * 1000)
+
+        # FORCE Custom Format: 445 -> "445.0"
+        strike_str = str(float(strike))
+
         root = underlying.strip().upper()
-        return f"{root}{yymmdd}{type_char}{strike_int:08d}"
+        return f"{root}{yymmdd}{type_char}{strike_str}"
     except Exception:
+        # Fallback
         return f"{underlying}_{op_type}_{strike}_{expiration}"
 
 
@@ -79,7 +87,7 @@ catalog = pd.read_csv(CATALOG_FILE, low_memory=False)
 
 # Robust Date Parsing
 catalog["date"] = pd.to_datetime(catalog["date"], errors='coerce')
-catalog = catalog.dropna(subset=['date'])  # Drop header rows/garbage
+catalog = catalog.dropna(subset=['date'])
 catalog["date"] = catalog["date"].dt.date
 
 if "expiration" in catalog.columns:
@@ -104,37 +112,50 @@ if days_lag > 3:
 catalog_today = catalog[catalog["date"] == TRADE_DATE].copy()
 catalog_today["row_id"] = catalog_today.index
 
-# --- [NEW] INJECT UNDERLYING PRICE ---
-# AlphaVantage Options CSV usually lacks the stock price. We fetch it here.
+# --- INJECT UNDERLYING PRICE (ROBUST) ---
 print(f"Fetching {UNDERLYING_SYMBOL} price for {TRADE_DATE} via yfinance...")
+found_price = False
+spot_price = 0.0
+
 try:
-    # Fetch 2 days to ensure we cover the specific date
     start_dt = pd.Timestamp(TRADE_DATE)
     end_dt = start_dt + timedelta(days=2)
 
     ticker = yf.Ticker(UNDERLYING_SYMBOL)
     hist = ticker.history(start=start_dt, end=end_dt)
 
-    # Locate exact date or closest
     if not hist.empty:
-        # Normalize index to date
         hist.index = hist.index.date
         if TRADE_DATE in hist.index:
-            spot_price = hist.loc[TRADE_DATE]['Close']
+            spot_price = float(hist.loc[TRADE_DATE]['Close'])
             print(f"  ✅ Found Close Price: ${spot_price:.2f}")
-            catalog_today['underlying_price'] = float(spot_price)
+            found_price = True
         else:
-            # Fallback to first available if exact date missing (e.g. slight mismatch)
-            spot_price = hist['Close'].iloc[0]
+            spot_price = float(hist['Close'].iloc[0])
             print(f"  ⚠️ Exact date match failed. Using closest: ${spot_price:.2f}")
-            catalog_today['underlying_price'] = float(spot_price)
+            found_price = True
     else:
-        print("  ❌ yfinance returned no data. Filters will likely fail.")
-        catalog_today['underlying_price'] = 0.0
+        print("  ❌ yfinance returned no data.")
 
 except Exception as e:
     print(f"  ❌ Price Fetch Failed: {e}")
-    catalog_today['underlying_price'] = 0.0
+
+if found_price and spot_price > 0:
+    catalog_today['underlying_price'] = spot_price
+else:
+    # FALLBACK: Check if catalog already has a valid price
+    if "underlying_price" in catalog_today.columns:
+        valid_prices = catalog_today[catalog_today["underlying_price"] > 0]["underlying_price"]
+        if not valid_prices.empty:
+            fallback_price = valid_prices.median()
+            print(f"  ⚠️ Using median price from catalog: ${fallback_price:.2f}")
+            catalog_today['underlying_price'] = fallback_price
+        else:
+            print("[CRITICAL] No valid underlying price found in YFinance OR Catalog. Aborting.")
+            sys.exit(1)
+    else:
+        print("[CRITICAL] underlying_price column missing and YFinance failed. Aborting.")
+        sys.exit(1)
 
 # 2. GENERATE CANDIDATES
 print(f"\nGenerating candidates...")
@@ -144,7 +165,7 @@ try:
         min_dte=7,
         max_dte=45,
         max_candidates=MAX_CANDIDATES,
-        min_vol=50,
+        min_vol=1,  # Relaxed volume filter
         min_oi=100
     )
     generator = CandidateGenerator(gen_config)
@@ -152,7 +173,6 @@ except TypeError:
     print("Warning: Using Default CandidateGenerator.")
     generator = CandidateGenerator()
 
-# Pass the DF (which now has 'underlying_price') to the generator
 candidates = generator.generate(catalog_today, trade_date=str(TRADE_DATE))
 print(f"Generated {len(candidates)} candidates.")
 
@@ -173,11 +193,25 @@ try:
     mu_arithmetic = raw_mu_log + 0.5 * (raw_sigma ** 2)
     fusion_output['mu'] = mu_arithmetic
 
-    print(f"  -> Adj. Mu (Arith): {mu_arithmetic:.4f}")
+    print(f"  -> Model Prediction: Adj. Mu {mu_arithmetic:.4f} | Sigma {raw_sigma:.4f}")
 
 except Exception as e:
-    print(f"CRITICAL PREDICTION FAILURE: {e}")
-    sys.exit(1)
+    print(f"  ⚠️ PREDICTION FAILED: {e}")
+    print("  -> ACTION: Switching to FALLBACK MODE (Neutral Assumptions)")
+
+    # Define variables to avoid NameError later
+    raw_mu_log = RISK_FREE_RATE
+    raw_sigma = 0.40
+    raw_aiv = 0.0
+
+    fusion_output = {
+        'mu': raw_mu_log,
+        'sigma': raw_sigma,
+        'aiv': raw_aiv
+    }
+    fusion_output['mu'] = raw_mu_log + 0.5 * (raw_sigma ** 2)
+
+    print(f"  -> Fallback: Mu {fusion_output['mu']:.4f} | Sigma {fusion_output['sigma']:.4f}")
 
 # 4. SIMULATE & DECIDE
 print(f"\nStarting Evaluation ({NUM_MC_PATHS} paths x {N_SEEDS} seeds)...")
@@ -238,8 +272,16 @@ for idx, candidate in enumerate(candidates, start=1):
         oi = leg.get('open_interest', 0)
         entry_price = market_state.get('price', 0.0)
         mid_price = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else entry_price
-        contract_id = get_occ_symbol(UNDERLYING_SYMBOL, expiration, cand_type, strike)
-        spread_pct = (ask - bid) / entry_price if entry_price > 0 else 0.0
+
+        # --- SYMBOL GENERATION ---
+        # Prioritize existing ID, else use CUSTOM GENERATOR
+        contract_id = leg.get("contractID")
+        if not contract_id:
+            contract_id = get_occ_symbol(UNDERLYING_SYMBOL, expiration, cand_type, strike)
+
+        # Spread on Mid
+        denom = mid_price if mid_price > 0 else entry_price
+        spread_pct = (ask - bid) / denom if denom > 0 else 0.0
 
         base_row = {
             "run_id": RUN_ID,
@@ -285,6 +327,15 @@ for idx, candidate in enumerate(candidates, start=1):
 
         if skipped:
             print(f"  [Candidate {idx}] SKIPPED ({skip_reason})")
+            # Log SKIP
+            skip_row = base_row.copy()
+            skip_row.update({
+                "decision": "SKIP",
+                "reason": skip_reason,
+                "seed_type": "N/A", "seed_val": "N/A",
+                "expected_pnl": 0, "prob_profit": 0, "downside_sharpe": 0
+            })
+            all_ledger_rows.append(skip_row)
             continue
 
         # --- SIMULATION ---
@@ -308,7 +359,7 @@ for idx, candidate in enumerate(candidates, start=1):
         )
 
         status = "✅ ACCEPT" if decision.decision == DecisionType.TRADE else "❌ REJECT"
-        print(f"  [Candidate {idx}] {status} | {contract_id} | {cand_type} {strike}")
+        print(f"  [Candidate {idx}] {status} | {contract_id}")
 
         if decision.decision == DecisionType.TRADE:
             composite_score = agg['downside_sharpe_mean'] - (0.5 * agg['downside_sharpe_std'])
@@ -324,11 +375,59 @@ for idx, candidate in enumerate(candidates, start=1):
                 "var": agg['VaR_95_mean']
             })
 
-        # Add rows to ledger (Skipped for brevity in this display, but loop logic handles it)
-        # ... (Ledger append logic is same as previous) ...
+        # Add Per-Seed Rows
+        for r in per_seed_rows:
+            full_row = base_row.copy()
+            full_row.update({
+                "seed_type": "INDIVIDUAL",
+                "seed_val": r["seed_val"],
+                "decision": "N/A", "reason": "N/A",
+                "expected_pnl": f"{r['expected_pnl']:.4f}",
+                "prob_profit": f"{r['prob_profit']:.4f}",
+                "downside_sharpe": f"{r['downside_sharpe']:.4f}",
+                "mc_sharpe": f"{r['mc_sharpe']:.4f}",
+                "VaR95": f"{r['VaR_95']:.4f}",
+                "expected_opt_price": f"{r['expected_option_price']:.4f}",
+                "p10_value": f"{r['p10_value']:.4f}", "p90_value": f"{r['p90_value']:.4f}",
+                "TP_rate": r.get("exit_rate_tp", 0), "SL_rate": r.get("exit_rate_sl", 0),
+                "BE_rate": r.get("exit_rate_be", 0), "Hold_rate": r.get("hold_rate", 0),
+                "avg_exit_day": r.get("exit_day_mean", 0)
+            })
+            all_ledger_rows.append(full_row)
+
+        # Add Aggregate Row
+        agg_row = base_row.copy()
+        agg_row.update({
+            "seed_type": "AGGREGATE",
+            "seed_val": "MEAN",
+            "decision": decision.decision.value,
+            "reason": decision.reason,
+            "expected_pnl": f"{agg['expected_pnl_mean']:.4f}",
+            "prob_profit": f"{agg['prob_profit_mean']:.4f}",
+            "downside_sharpe": f"{agg['downside_sharpe_mean']:.4f}",
+            "mc_sharpe": f"{agg['mc_sharpe_mean']:.4f}",
+            "VaR95": f"{agg['VaR_95_mean']:.4f}",
+            "expected_opt_price": f"{agg['expected_option_price_mean']:.4f}",
+            "p10_value": f"{agg['p10_value_mean']:.4f}", "p90_value": f"{agg['p90_value_mean']:.4f}",
+            "expected_pnl_std": f"{agg['expected_pnl_std']:.4f}",
+            "prob_profit_std": f"{agg['prob_profit_std']:.4f}",
+            "downside_sharpe_std": f"{agg['downside_sharpe_std']:.4f}",
+            "VaR95_std": f"{agg['VaR_95_std']:.4f}",
+            "TP_rate": f"{agg.get('exit_rate_tp_mean', 0):.2f}",
+            "SL_rate": f"{agg.get('exit_rate_sl_mean', 0):.2f}",
+            "BE_rate": f"{agg.get('exit_rate_be_mean', 0):.2f}",
+            "Hold_rate": f"{agg.get('hold_rate_mean', 0):.2f}",
+            "avg_exit_day": f"{agg.get('exit_day_mean_mean', 0):.1f}"
+        })
+        all_ledger_rows.append(agg_row)
 
     except Exception as e:
         print(f"  [Candidate {idx}] Failed: {e}")
+
+# WRITE LEDGER BATCH
+if all_ledger_rows:
+    append_ledger_rows(LEDGER_FILE, all_ledger_rows, headers=ledger_headers)
+    print(f"\n[LEDGER] Saved {len(all_ledger_rows)} rows to {LEDGER_FILE}")
 
 # SUMMARY
 if accepted_trades:
