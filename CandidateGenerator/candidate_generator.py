@@ -1,8 +1,24 @@
 import pandas as pd
 import os
 import numpy as np
+import logging
 from dataclasses import dataclass
 from typing import TypedDict, List, Literal, Optional
+
+# --- LOGGING CONFIGURATION ---
+LOG_DIR = r"C:\My Documents\Mics\Logs"
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_DIR, "candidate_generator.log")
+
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    filemode='a'  # 'a' ensures append-only mode
+)
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+logging.getLogger('').addHandler(console)
 
 
 # --- CANONICAL SCHEMA DEFINITION ---
@@ -50,19 +66,27 @@ class CandidateGenerator:
 
     def __init__(self, config: GeneratorConfig = None):
         self.cfg = config if config else GeneratorConfig()
+        logging.info("CandidateGenerator initialized.")
 
     def load_catalog(self, file_path=None):
         path = file_path if file_path else self.DEFAULT_PATH
+        logging.info(f"Loading catalog from: {path}")
         if not os.path.exists(path):
+            logging.error(f"Catalog not found at: {path}")
             raise FileNotFoundError(f"Catalog not found at: {path}")
+
         df = pd.read_csv(path)
         # Ensure dates are datetime
         for col in ['date', 'expiration']:
             if col in df.columns:
                 df[col] = pd.to_datetime(df[col], errors='coerce')
+
+        logging.info(f"Catalog loaded successfully with {len(df)} rows.")
         return df
 
     def generate(self, catalog_df: pd.DataFrame, trade_date: str = None) -> List[CandidateTrade]:
+        logging.info(f"Starting candidate generation. Trade Date: {trade_date}")
+
         # 1. Date Filtering
         if trade_date:
             target_date = pd.to_datetime(trade_date).date()
@@ -74,12 +98,10 @@ class CandidateGenerator:
             df = catalog_df.copy()
 
         if df.empty:
-            print("DEBUG: DataFrame is empty after date filter.")
+            logging.warning("DataFrame is empty after date filter.")
             return []
 
         # --- FIX 1: Normalize Columns (Aliases) ---
-        # AlphaVantage/others might use different names. We map them to our internal standard.
-        # Check your CSV to see what the column actually is (e.g. 'underlying', 'spot', 'mark')
         column_mapping = {
             'underlying': 'underlying_price',
             'spot': 'underlying_price',
@@ -99,14 +121,15 @@ class CandidateGenerator:
                 # Fill NaNs with -1 to be caught by filters later
                 df['dte'] = df['dte'].fillna(-1).astype(int)
             else:
-                print("CRITICAL WARNING: 'dte' column missing and cannot be calculated (missing date/expiration).")
+                logging.warning(
+                    "CRITICAL WARNING: 'dte' column missing and cannot be calculated (missing date/expiration).")
                 # Create dummy DTE to prevent immediate crash, but these rows will likely be filtered out
                 df['dte'] = -1
 
         # --- FIX 3: Ensure Underlying Price Exists ---
         if 'underlying_price' not in df.columns:
             # Attempt to find it via implied means or fill with 0 (will be dropped)
-            print("CRITICAL WARNING: 'underlying_price' column missing.")
+            logging.warning("CRITICAL WARNING: 'underlying_price' column missing.")
             df['underlying_price'] = np.nan
 
         # 2. Strict IV & Numeric Coercion
@@ -115,7 +138,7 @@ class CandidateGenerator:
                 df = df.rename(columns={'iv': IV_COL})
             else:
                 # If IV is totally missing, we can't trade.
-                print(f"CRITICAL: Missing required column '{IV_COL}'.")
+                logging.error(f"CRITICAL: Missing required column '{IV_COL}'.")
                 return []
 
         df[IV_COL] = pd.to_numeric(df[IV_COL], errors='coerce')
@@ -130,11 +153,10 @@ class CandidateGenerator:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
 
         # Drop rows with missing core data
-        # Now that we've calculated/renamed them, this check should pass for valid rows
         cols_to_check = ['dte', 'strike', 'underlying_price', 'opt_price']
         missing_mask = df[cols_to_check].isna().any(axis=1)
         if missing_mask.any():
-            # print(f"DEBUG: Dropping {missing_mask.sum()} rows due to missing {cols_to_check}")
+            logging.debug(f"Dropping {missing_mask.sum()} rows due to missing {cols_to_check}")
             df = df.dropna(subset=cols_to_check)
 
         # Fill Greeks (Optional)
@@ -150,7 +172,7 @@ class CandidateGenerator:
                 (df['open_interest'] >= self.cfg.min_oi)
         )
         df = df[mask]
-        print(f"DEBUG: {len(df)} rows remaining after filters.")
+        logging.info(f"{len(df)} rows remaining after filters.")
 
         candidates: List[CandidateTrade] = []
 
@@ -216,7 +238,9 @@ class CandidateGenerator:
             cand = self._make_candidate(name, struct_type, clean_legs, spot, raw_date)
             self._validate_candidate(cand)
             candidates_list.append(cand)
-        except (ValueError, IndexError):
+        except (ValueError, IndexError) as e:
+            # Logging failures at DEBUG level to avoid flooding logs with minor validation issues
+            logging.debug(f"Failed to add candidate {name}: {e}")
             pass
 
     def _try_add_spread(self, candidates_list, name, struct_type, raw_legs, sides, spot):
@@ -228,7 +252,8 @@ class CandidateGenerator:
             cand = self._make_candidate(name, struct_type, clean_legs, spot, raw_date)
             self._validate_candidate(cand)
             candidates_list.append(cand)
-        except (ValueError, IndexError):
+        except (ValueError, IndexError) as e:
+            logging.debug(f"Failed to add spread {name}: {e}")
             pass
 
     def _make_candidate(self, name, struct_type, legs, underlying_price, date_val) -> CandidateTrade:
@@ -296,6 +321,8 @@ if __name__ == "__main__":
         df = gen.load_catalog()
         latest_date = df['date'].max()
         results = gen.generate(df, trade_date=str(latest_date.date()))
-        print(f"Generated {len(results)} Candidates.")
+        logging.info(f"Generated {len(results)} Candidates.")
+        print(f"Generated {len(results)} Candidates.")  # Keep console output for immediate feedback
     except Exception as e:
+        logging.error(f"Error during execution: {e}")
         print(f"Error: {e}")
