@@ -1,328 +1,171 @@
 import pandas as pd
-import os
 import numpy as np
+from datetime import datetime, timedelta
+from typing import List, Dict, Optional
 import logging
-from dataclasses import dataclass
-from typing import TypedDict, List, Literal, Optional
-
-# --- LOGGING CONFIGURATION ---
-LOG_DIR = r"C:\My Documents\Mics\Logs"
-os.makedirs(LOG_DIR, exist_ok=True)
-LOG_FILE = os.path.join(LOG_DIR, "candidate_generator.log")
-
-logging.basicConfig(
-    filename=LOG_FILE,
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    filemode='a'  # 'a' ensures append-only mode
-)
-console = logging.StreamHandler()
-console.setLevel(logging.INFO)
-logging.getLogger('').addHandler(console)
+from config import Config
 
 
-# --- CANONICAL SCHEMA DEFINITION ---
-class OptionLeg(TypedDict):
-    row_id: int
-    expiration: str
-    strike: float
-    type: Literal['call', 'put']
-    side: Literal['long', 'short']
-    dte: int
-    iv: float
-    entry_price: float
-    bid: float
-    ask: float
-    delta: float
-    vega: float
-
-
-class CandidateTrade(TypedDict):
-    date: str
-    structure: str
-    type: str
-    underlying_price: float
-    legs: List[OptionLeg]
-
-
-# 1️⃣ CONSTANT: Canonical IV Column Name
-IV_COL = "implied_volatility"
-
-
-@dataclass
+# --- CONFIGURATION CLASS ---
 class GeneratorConfig:
-    min_dte: int = 7
-    max_dte: int = 45
-    min_vol: int = 1
-    min_oi: int = 1
-    max_candidates: int = 30
+    def __init__(self):
+        self.MIN_DTE = 7
+        self.MAX_DTE = 45
+        self.MIN_DELTA = 0.20
+        self.MAX_DELTA = 0.50
+        self.MIN_LIQUIDITY = 100
+        self.MAX_SPREAD_PCT = 0.05
+        self.SPREAD_WIDTHS = [5, 10]
 
 
 class CandidateGenerator:
-    DEFAULT_PATH = r"C:\My Documents\Mics\Logs\TSLA_Options_Contracts.csv"
+    """
+    Generates trade candidates with deterministic IDs and complete economics.
+    """
 
-    # SAFETY: Disable spreads until Monte Carlo supports multi-leg valuation
-    ENABLE_SPREADS = False
+    def __init__(self, catalog_path: str, current_price: float, trade_date=None, config: GeneratorConfig = None):
+        self.catalog_path = catalog_path
+        self.current_price = current_price
+        self.config = config if config else GeneratorConfig()
 
-    def __init__(self, config: GeneratorConfig = None):
-        self.cfg = config if config else GeneratorConfig()
-        logging.info("CandidateGenerator initialized.")
-
-    def load_catalog(self, file_path=None):
-        path = file_path if file_path else self.DEFAULT_PATH
-        logging.info(f"Loading catalog from: {path}")
-        if not os.path.exists(path):
-            logging.error(f"Catalog not found at: {path}")
-            raise FileNotFoundError(f"Catalog not found at: {path}")
-
-        df = pd.read_csv(path)
-        # Ensure dates are datetime
-        for col in ['date', 'expiration']:
-            if col in df.columns:
-                df[col] = pd.to_datetime(df[col], errors='coerce')
-
-        logging.info(f"Catalog loaded successfully with {len(df)} rows.")
-        return df
-
-    def generate(self, catalog_df: pd.DataFrame, trade_date: str = None) -> List[CandidateTrade]:
-        logging.info(f"Starting candidate generation. Trade Date: {trade_date}")
-
-        # 1. Date Filtering
+        # Time Consistency
         if trade_date:
-            target_date = pd.to_datetime(trade_date).date()
-            df = catalog_df.copy()
-            if not pd.api.types.is_datetime64_any_dtype(df['date']):
-                df['date'] = pd.to_datetime(df['date'], errors='coerce')
-            df = df[df['date'].dt.date == target_date].copy()
+            self.trade_date = pd.Timestamp(trade_date)
         else:
-            df = catalog_df.copy()
+            self.trade_date = pd.Timestamp.now()
 
-        if df.empty:
-            logging.warning("DataFrame is empty after date filter.")
-            return []
+        # Strategy Gates
+        self.enable_spreads = Config.ENABLE_SPREADS
+        self.enable_single_legs = Config.ENABLE_SINGLE_LEGS
 
-        # --- FIX 1: Normalize Columns (Aliases) ---
-        column_mapping = {
-            'underlying': 'underlying_price',
-            'spot': 'underlying_price',
-            'current_price': 'underlying_price',
-            'close': 'opt_price',  # If 'opt_price' is missing, use 'close'
-            'last': 'opt_price'  # Or 'last'
-        }
-        df = df.rename(columns=column_mapping)
+        self.catalog = None
+        self._load_catalog()
 
-        # --- FIX 2: Calculate Missing DTE ---
-        # If 'dte' is missing, calculate it from Expiration - Date
-        if 'dte' not in df.columns:
-            if 'expiration' in df.columns and 'date' in df.columns:
-                df['expiration'] = pd.to_datetime(df['expiration'], errors='coerce')
-                df['date'] = pd.to_datetime(df['date'], errors='coerce')
-                df['dte'] = (df['expiration'] - df['date']).dt.days
-                # Fill NaNs with -1 to be caught by filters later
-                df['dte'] = df['dte'].fillna(-1).astype(int)
-            else:
-                logging.warning(
-                    "CRITICAL WARNING: 'dte' column missing and cannot be calculated (missing date/expiration).")
-                # Create dummy DTE to prevent immediate crash, but these rows will likely be filtered out
-                df['dte'] = -1
-
-        # --- FIX 3: Ensure Underlying Price Exists ---
-        if 'underlying_price' not in df.columns:
-            # Attempt to find it via implied means or fill with 0 (will be dropped)
-            logging.warning("CRITICAL WARNING: 'underlying_price' column missing.")
-            df['underlying_price'] = np.nan
-
-        # 2. Strict IV & Numeric Coercion
-        if IV_COL not in df.columns:
-            if 'iv' in df.columns:
-                df = df.rename(columns={'iv': IV_COL})
-            else:
-                # If IV is totally missing, we can't trade.
-                logging.error(f"CRITICAL: Missing required column '{IV_COL}'.")
-                return []
-
-        df[IV_COL] = pd.to_numeric(df[IV_COL], errors='coerce')
-
-        # IV Sanity Cap (0 < IV < 3.0)
-        df = df[(df[IV_COL] > 0) & (df[IV_COL] < 3.0)]
-
-        # Core Columns Handling
-        core_cols = ['dte', 'volume', 'open_interest', 'strike', 'underlying_price', 'opt_price', 'bid', 'ask']
-        for col in core_cols:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-
-        # Drop rows with missing core data
-        cols_to_check = ['dte', 'strike', 'underlying_price', 'opt_price']
-        missing_mask = df[cols_to_check].isna().any(axis=1)
-        if missing_mask.any():
-            logging.debug(f"Dropping {missing_mask.sum()} rows due to missing {cols_to_check}")
-            df = df.dropna(subset=cols_to_check)
-
-        # Fill Greeks (Optional)
-        for col in ['delta', 'vega', 'gamma']:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-
-        # Apply Constraints
-        mask = (
-                (df['dte'] >= self.cfg.min_dte) &
-                (df['dte'] <= self.cfg.max_dte) &
-                (df['volume'] >= self.cfg.min_vol) &
-                (df['open_interest'] >= self.cfg.min_oi)
-        )
-        df = df[mask]
-        logging.info(f"{len(df)} rows remaining after filters.")
-
-        candidates: List[CandidateTrade] = []
-
-        # 3. Generate Candidates per Expiration
-        for expiry, group in df.groupby('expiration'):
-            current_price = group['underlying_price'].iloc[0]
-
-            # Normalize type casing
-            group = group.copy()
-            if 'type' in group.columns:
-                group['type'] = group['type'].astype(str).str.lower()
-
-            calls = group[group['type'] == 'call'].sort_values('strike')
-            puts = group[group['type'] == 'put'].sort_values('strike')
-
-            if calls.empty and puts.empty: continue
-
-            # --- SINGLE LEGS (ATM) ---
-            if not calls.empty:
-                idx = (calls['strike'] - current_price).abs().argsort()[:1]
-                atm_call = calls.iloc[idx]
-                if not atm_call.empty:
-                    self._try_add_candidate(candidates, "ATM Call", "Single", [atm_call.iloc[0]], current_price)
-
-            if not puts.empty:
-                idx = (puts['strike'] - current_price).abs().argsort()[:1]
-                atm_put = puts.iloc[idx]
-                if not atm_put.empty:
-                    self._try_add_candidate(candidates, "ATM Put", "Single", [atm_put.iloc[0]], current_price)
-
-            # --- VERTICAL SPREADS (Gated) ---
-            if self.ENABLE_SPREADS:
-                # Bull Call Spread
-                if len(calls) > 2:
-                    if not (calls['strike'] - current_price).abs().empty:
-                        idx_atm = (calls['strike'] - current_price).abs().argsort()[:1].values[0]
-                        idx_short = idx_atm + 2
-                        if idx_short < len(calls):
-                            long_leg = calls.iloc[idx_atm]
-                            short_leg = calls.iloc[idx_short]
-                            if short_leg['strike'] > long_leg['strike']:
-                                self._try_add_spread(candidates, "Bull Call Spread", "Vertical",
-                                                     [long_leg, short_leg], ['long', 'short'], current_price)
-
-                # Bear Put Spread
-                if len(puts) > 2:
-                    if not (puts['strike'] - current_price).abs().empty:
-                        idx_atm = (puts['strike'] - current_price).abs().argsort()[:1].values[0]
-                        idx_short = idx_atm - 2
-                        if idx_short >= 0:
-                            long_leg = puts.iloc[idx_atm]
-                            short_leg = puts.iloc[idx_short]
-                            if short_leg['strike'] < long_leg['strike']:
-                                self._try_add_spread(candidates, "Bear Put Spread", "Vertical",
-                                                     [long_leg, short_leg], ['long', 'short'], current_price)
-
-        return candidates[:self.cfg.max_candidates]
-
-    def _try_add_candidate(self, candidates_list, name, struct_type, legs, spot):
+    def _load_catalog(self):
         try:
-            raw_date = legs[0]['date']
-            clean_legs = [self._clean_leg(legs[0], side='long')]
-            cand = self._make_candidate(name, struct_type, clean_legs, spot, raw_date)
-            self._validate_candidate(cand)
-            candidates_list.append(cand)
-        except (ValueError, IndexError) as e:
-            # Logging failures at DEBUG level to avoid flooding logs with minor validation issues
-            logging.debug(f"Failed to add candidate {name}: {e}")
-            pass
+            self.catalog = pd.read_csv(self.catalog_path)
 
-    def _try_add_spread(self, candidates_list, name, struct_type, raw_legs, sides, spot):
-        try:
-            raw_date = raw_legs[0]['date']
-            clean_legs = []
-            for raw_leg, side in zip(raw_legs, sides):
-                clean_legs.append(self._clean_leg(raw_leg, side=side))
-            cand = self._make_candidate(name, struct_type, clean_legs, spot, raw_date)
-            self._validate_candidate(cand)
-            candidates_list.append(cand)
-        except (ValueError, IndexError) as e:
-            logging.debug(f"Failed to add spread {name}: {e}")
-            pass
+            # Normalization
+            if 'type' in self.catalog.columns:
+                self.catalog['type'] = self.catalog['type'].str.upper().str.strip()
 
-    def _make_candidate(self, name, struct_type, legs, underlying_price, date_val) -> CandidateTrade:
-        if not isinstance(date_val, pd.Timestamp):
-            date_val = pd.to_datetime(date_val)
-        return {
-            "date": date_val.strftime('%Y-%m-%d'),
-            "structure": name,
-            "type": struct_type,
-            "underlying_price": float(underlying_price),
-            "legs": legs
-        }
+            # Dedup based on Contract ID
+            if 'contractID' in self.catalog.columns:
+                self.catalog = self.catalog.drop_duplicates(subset=['contractID'])
+            else:
+                self.catalog = self.catalog.drop_duplicates(subset=['expiration', 'strike', 'type'])
 
-    def _clean_leg(self, row, side: Literal['long', 'short'] = 'long') -> OptionLeg:
-        iv = float(row[IV_COL])
+            # Conversions
+            self.catalog['expiration'] = pd.to_datetime(self.catalog['expiration'])
+            cols = ['strike', 'ask', 'bid', 'openInterest', 'volume']
+            for c in cols:
+                if c in self.catalog.columns:
+                    self.catalog[c] = pd.to_numeric(self.catalog[c], errors='coerce')
 
-        # Canonical Entry Price logic
-        if 'opt_price' in row and not pd.isna(row['opt_price']):
-            entry = float(row['opt_price'])
-        elif 'bid' in row and 'ask' in row and not pd.isna(row['bid']):
-            entry = (float(row['bid']) + float(row['ask'])) / 2.0
-        else:
-            entry = 0.0
+            # Quality Filters
+            self.catalog = self.catalog[
+                (self.catalog['bid'] > 0) &
+                (self.catalog['ask'] > 0) &
+                (self.catalog['ask'] > self.catalog['bid'])
+                ].copy()
 
-        if isinstance(row['expiration'], pd.Timestamp):
-            exp_str = row['expiration'].strftime('%Y-%m-%d')
-        else:
-            exp_str = str(row['expiration'])
+            self.catalog['mid'] = (self.catalog['ask'] + self.catalog['bid']) / 2
+            self.catalog['spread_pct'] = (self.catalog['ask'] - self.catalog['bid']) / self.catalog['mid']
 
-        row_id = int(row.get('row_id', -1))
+            # Liquidity & Spread Gates
+            self.catalog = self.catalog[self.catalog['spread_pct'] <= self.config.MAX_SPREAD_PCT]
+            self.catalog['openInterest'] = self.catalog['openInterest'].fillna(0)
+            self.catalog['volume'] = self.catalog['volume'].fillna(0)
+            self.catalog = self.catalog[
+                (self.catalog['openInterest'] >= self.config.MIN_LIQUIDITY) |
+                (self.catalog['volume'] >= self.config.MIN_LIQUIDITY)
+                ]
 
-        return {
-            "row_id": row_id,
-            "expiration": exp_str,
-            "strike": float(row['strike']),
-            "type": row['type'],
-            "side": side,
-            "dte": int(row['dte']),
-            "iv": iv,
-            "entry_price": entry,
-            "bid": float(row.get('bid', 0)),
-            "ask": float(row.get('ask', 0)),
-            "delta": float(row.get('delta', 0)),
-            "vega": float(row.get('vega', 0))
-        }
+            logging.info(f"[CandidateGenerator] Loaded {len(self.catalog)} valid contracts.")
 
-    def _validate_candidate(self, cand: CandidateTrade):
-        if cand['underlying_price'] <= 0:
-            raise ValueError(f"Invalid underlying price: {cand['underlying_price']}")
-        if not cand['legs']:
-            raise ValueError("Candidate has no legs")
-        for leg in cand['legs']:
-            if leg['iv'] <= 0 or leg['iv'] >= 3.0:
-                raise ValueError(f"Invalid IV: {leg['iv']}")
-            if leg['entry_price'] <= 0:
-                raise ValueError(f"Invalid Entry Price: {leg['entry_price']}")
-            if leg['dte'] <= 0:
-                # Allow 0 DTE for expiration day trading if desired, else keep > 0
-                pass
+        except Exception as e:
+            logging.error(f"[CandidateGenerator] Failed to load catalog: {e}")
+            self.catalog = pd.DataFrame()
 
+    def generate_candidates(self) -> List[Dict]:
+        candidates = []
+        if self.catalog.empty: return candidates
 
-if __name__ == "__main__":
-    gen = CandidateGenerator()
-    try:
-        df = gen.load_catalog()
-        latest_date = df['date'].max()
-        results = gen.generate(df, trade_date=str(latest_date.date()))
-        logging.info(f"Generated {len(results)} Candidates.")
-        print(f"Generated {len(results)} Candidates.")  # Keep console output for immediate feedback
-    except Exception as e:
-        logging.error(f"Error during execution: {e}")
-        print(f"Error: {e}")
+        self.catalog['dte'] = (self.catalog['expiration'] - self.trade_date).dt.days
+        subset = self.catalog[
+            (self.catalog['dte'] >= self.config.MIN_DTE) &
+            (self.catalog['dte'] <= self.config.MAX_DTE)
+            ].copy()
+
+        # Generate Puts
+        puts = subset[subset['type'] == 'PUT']
+        puts = puts[
+            (puts['strike'] >= self.current_price * 0.85) &
+            (puts['strike'] <= self.current_price * 1.10)
+            ]
+
+        # TODO: Implement Top-K ranking here to prevent candidate explosion (Priority 2)
+
+        for _, row in puts.iterrows():
+            # 1. Single Legs (Gated)
+            if self.enable_single_legs:
+                # FIX 2: Exact Math for Max Gain (Strike - Cost)
+                max_gain = row['strike'] - row['ask']
+
+                candidates.append({
+                    'strategy': 'SINGLE_PUT',
+                    'contractID': row['contractID'],
+                    'legs': [row.to_dict()],
+                    'economics': {
+                        'entry_cost': row['ask'],
+                        'max_loss': row['ask'],
+                        'max_gain': max_gain,  # Explicit finite number
+                        'breakeven': row['strike'] - row['ask']
+                    }
+                })
+
+            # 2. Spreads (Gated)
+            if self.enable_spreads:
+                self._generate_spreads_for_leg(row, puts, candidates)
+
+        return candidates
+
+    def _generate_spreads_for_leg(self, long_leg, all_puts, candidates_list):
+        for width in self.config.SPREAD_WIDTHS:
+            target_short_strike = long_leg['strike'] - width
+
+            matches = all_puts[
+                (all_puts['expiration'] == long_leg['expiration']) &
+                (np.isclose(all_puts['strike'], target_short_strike, atol=0.5))
+                ].copy()
+
+            if not matches.empty:
+                matches = matches.sort_values(by=['openInterest', 'volume'], ascending=[False, False])
+                short_leg = matches.iloc[0]
+
+                # Economics
+                net_debit = long_leg['ask'] - short_leg['bid']
+                if net_debit <= 0.01: continue
+
+                max_loss = net_debit
+                max_gain = width - net_debit
+                breakeven = long_leg['strike'] - net_debit
+
+                # FIX 1: Canonical ID with Expiration Date (YYYYMMDD)
+                # Format: SPREAD_YYYYMMDD_LONG_SHORT_TYPE
+                exp_str = long_leg['expiration'].strftime('%Y%m%d')
+                composite_id = f"SPREAD_{exp_str}_{long_leg['strike']}_{short_leg['strike']}_PUT_DEBIT"
+
+                spread_candidate = {
+                    'strategy': 'VERTICAL_PUT_DEBIT',
+                    'contractID': composite_id,
+                    'legs': [long_leg.to_dict(), short_leg.to_dict()],
+                    'economics': {
+                        'entry_cost': round(net_debit, 2),
+                        'max_loss': round(max_loss, 2),
+                        'max_gain': round(max_gain, 2),
+                        'breakeven': round(breakeven, 2),
+                        'width': width
+                    }
+                }
+                candidates_list.append(spread_candidate)

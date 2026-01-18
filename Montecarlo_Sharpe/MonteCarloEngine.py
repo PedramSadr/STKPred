@@ -1,321 +1,114 @@
 import numpy as np
-from scipy.stats import norm
-from dataclasses import dataclass
-
-
-@dataclass
-class ExitRules:
-    use_path_exits: bool = False
-    hold_days: int = 14
-
-    # Exits
-    take_profit_pct: float = 0.50
-    stop_loss_pct: float = 0.30
-    be_trigger_pct: float = 0.20
-    be_exit_buffer: float = 0.00
-
-    # Friction
-    slippage_pct: float = 0.01  # 1% slippage on exit
-
-    # Time/Vol
-    year_days: float = 252.0
-    aiv_is_10day_change: bool = True
-
-    # IV Physics
-    iv_daily_std: float = 0.01
-    iv_min: float = 0.01
-    iv_max: float = 3.00
+import pandas as pd
 
 
 class MonteCarloEngine:
-    def __init__(self, num_paths=50000, exit_config: ExitRules = None):
-        self.num_paths = num_paths
-        self.cfg = exit_config if exit_config else ExitRules()
+    """
+    Simulates underlying price paths to estimate Option/Spread P&L.
+    Priority 1 Fixes:
+    - Clamps P&L to spread economics (Max Gain/Max Loss).
+    - Uses trade_date for consistent DTE calculation.
+    - Computes CVaR (Conditional Value at Risk).
+    """
 
-    def generate_risk_metrics(self, fusion_output, market_state):
-        if self.cfg.use_path_exits:
-            return self._simulate_path_exits(fusion_output, market_state)
-        else:
-            return self._simulate_terminal_only(fusion_output, market_state)
+    def __init__(self, n_sims=5000, dt_days=1):
+        self.n_sims = n_sims
+        self.dt_days = dt_days  # Step size in days
 
-    # ----------------------------------------------------------------
-    # 1. PATH-EXIT SIMULATION (Active Management)
-    # ----------------------------------------------------------------
-    def _simulate_path_exits(self, fusion_output, market_state):
-        mu = float(fusion_output["mu"])
-        sigma = float(fusion_output["sigma"])
-        aiv = float(fusion_output["aiv"])
-
-        S0 = float(market_state["S"])
-        IV0 = float(market_state["IV"])
-        T_exp = float(market_state["T"])
-        r = float(market_state["r"])
-        K = float(market_state["K"])
-        is_call = bool(market_state["is_call"])
-
-        entry_price = float(market_state.get("price", 0.0))
-        if entry_price <= 0:
-            entry_price = self._black_scholes_single(S0, K, r, T_exp, IV0, is_call)
-
-        steps = int(self.cfg.hold_days)
-        if steps <= 0:
-            return self._compute_stats(np.zeros(self.num_paths), np.full(self.num_paths, entry_price))
-
-        year_days = float(getattr(self.cfg, "year_days", 252.0))
-        dt = 1.0 / year_days
-
-        # Expiry Safety
-        if T_exp <= 0.0:
-            terminal_val = self._black_scholes_single(S0, K, r, 0.0, IV0, is_call)
-            return self._compute_stats(np.full(self.num_paths, terminal_val - entry_price),
-                                       np.full(self.num_paths, terminal_val))
-
-        max_steps = int(np.floor(T_exp / dt))
-        steps = min(steps, max_steps) if max_steps > 0 else 0
-        if steps <= 0:
-            return self._compute_stats(np.zeros(self.num_paths), np.full(self.num_paths, entry_price))
-
-        # --- AIV scaling ---
-        aiv_is_10d = bool(getattr(self.cfg, "aiv_is_10day_change", False))
-        aiv_h = aiv * (steps / 10.0) if aiv_is_10d else aiv
-
-        # --- 1) Underlying paths ---
-        Z = np.random.standard_normal((self.num_paths, steps))
-        drift_step = (mu - 0.5 * sigma ** 2) * dt
-        diff_step = sigma * np.sqrt(dt) * Z
-        log_ret_acc = np.cumsum(drift_step + diff_step, axis=1)
-        S_paths = S0 * np.exp(log_ret_acc)
-
-        # --- 2) IV paths ---
-        t_idx = np.arange(1, steps + 1, dtype=np.float64)
-        iv_base = IV0 + aiv_h * (t_idx / steps)
-        iv_daily_std = float(getattr(self.cfg, "iv_daily_std", 0.01))
-        iv_shocks = np.random.normal(0.0, iv_daily_std, (self.num_paths, steps))
-        iv_cum_noise = np.cumsum(iv_shocks, axis=1)
-        IV_paths = iv_base[None, :] + iv_cum_noise
-
-        iv_min = float(getattr(self.cfg, "iv_min", 0.01))
-        iv_max = getattr(self.cfg, "iv_max", 3.0)
-        if iv_max is None:
-            IV_paths = np.maximum(iv_min, IV_paths)
-        else:
-            IV_paths = np.clip(IV_paths, iv_min, float(iv_max))
-
-        # --- 3) Option Pricing ---
-        T_rem_vec = np.maximum(T_exp - (t_idx * dt), 0.0)
-        Opt_paths = self._black_scholes_matrix(S_paths, K, r, T_rem_vec, IV_paths, is_call)
-
-        # --- 4) Exits with SLIPPAGE ---
-        ratios = Opt_paths / entry_price
-        final_values = Opt_paths[:, -1].copy()
-
-        active = np.ones(self.num_paths, dtype=bool)
-        be_armed = np.zeros(self.num_paths, dtype=bool)
-
-        exit_day = np.full(self.num_paths, -1, dtype=np.int16)
-        exit_reason = np.zeros(self.num_paths, dtype=np.int8)
-
-        tp_level = 1.0 + float(self.cfg.take_profit_pct)
-        sl_level = 1.0 - float(self.cfg.stop_loss_pct)
-        be_arm_level = 1.0 + float(self.cfg.be_trigger_pct)
-        be_exit_level = 1.0 + float(self.cfg.be_exit_buffer)
-
-        # Slippage Multiplier (1.0 - 0.01 = 0.99)
-        fill_mult = 1.0 - float(self.cfg.slippage_pct)
-
-        for t in range(steps):
-            if not active.any():
-                break
-
-            r_t = ratios[:, t]
-            p_t = Opt_paths[:, t]
-
-            # TP Exit
-            tp_hit = (r_t >= tp_level) & active
-            if tp_hit.any():
-                final_values[tp_hit] = p_t[tp_hit] * fill_mult
-                active[tp_hit] = False
-                exit_day[tp_hit] = t + 1
-                exit_reason[tp_hit] = 1
-
-            # SL Exit
-            sl_hit = (r_t <= sl_level) & active
-            if sl_hit.any():
-                final_values[sl_hit] = p_t[sl_hit] * fill_mult
-                active[sl_hit] = False
-                exit_day[sl_hit] = t + 1
-                exit_reason[sl_hit] = 2
-
-            # BE Arm
-            arm = (r_t >= be_arm_level) & active
-            if arm.any():
-                be_armed[arm] = True
-
-            # BE Exit
-            be_exit = (r_t <= be_exit_level) & be_armed & active
-            if be_exit.any():
-                final_values[be_exit] = p_t[be_exit] * fill_mult
-                active[be_exit] = False
-                exit_day[be_exit] = t + 1
-                exit_reason[be_exit] = 3
-
-        # Apply slippage to paths held to the end (optional, usually "market close" also has friction)
-        # For fairness, we apply slippage on final hold as well to simulate "getting out"
-        final_values[active] = final_values[active] * fill_mult
-
-        pnl = final_values - entry_price
-        stats = self._compute_stats(pnl, final_values)
-
-        # Diagnostics
-        stats["exit_day_mean"] = float(np.mean(np.where(exit_day < 0, steps, exit_day)))
-        stats["exit_rate_tp"] = float(np.mean(exit_reason == 1))
-        stats["exit_rate_sl"] = float(np.mean(exit_reason == 2))
-        stats["exit_rate_be"] = float(np.mean(exit_reason == 3))
-        stats["hold_rate"] = float(np.mean(exit_reason == 0))
-
-        return stats
-
-    # ----------------------------------------------------------------
-    # 2. TERMINAL-ONLY SIMULATION (Fast Triage)
-    # ----------------------------------------------------------------
-    def _simulate_terminal_only(self, fusion_output, market_state):
+    def analyze(self, candidate, current_price, entry_cost, trade_date=None):
         """
-        Fast 'Buy and Hold' simulation.
-        Prices ONLY at T=hold_days (or expiry).
-        Useful for A/B testing: 'Did active management beat buy-and-hold?'
+        Runs Monte Carlo simulation with time-consistency.
         """
-        mu = float(fusion_output["mu"])
-        sigma = float(fusion_output["sigma"])
-        aiv = float(fusion_output["aiv"])
-
-        S0 = float(market_state["S"])
-        IV0 = float(market_state["IV"])
-        T_exp = float(market_state["T"])
-        r = float(market_state["r"])
-        K = float(market_state["K"])
-        is_call = bool(market_state["is_call"])
-
-        entry_price = float(market_state.get("price", 0.0))
-        if entry_price <= 0:
-            entry_price = self._black_scholes_single(S0, K, r, T_exp, IV0, is_call)
-
-        year_days = float(getattr(self.cfg, "year_days", 252.0))
-        dt = 1.0 / year_days
-
-        steps = int(self.cfg.hold_days)
-        if steps <= 0:
-            return self._compute_stats(np.zeros(self.num_paths), np.full(self.num_paths, entry_price))
-
-        # Clamp Horizon
-        max_steps = int(np.floor(T_exp / dt))
-        steps_eff = min(steps, max_steps) if max_steps > 0 else 0
-        if steps_eff <= 0:
-            # Expired immediately
-            terminal_val = self._black_scholes_single(S0, K, r, max(T_exp, 0.0), IV0, is_call)
-            return self._compute_stats(np.full(self.num_paths, terminal_val - entry_price),
-                                       np.full(self.num_paths, terminal_val))
-
-        hold_T_eff = steps_eff * dt
-        T_rem = max(T_exp - hold_T_eff, 0.0)
-
-        # 1. Simulate S at Horizon (GBM)
-        Z = np.random.standard_normal(self.num_paths)
-        drift = (mu - 0.5 * sigma ** 2) * hold_T_eff
-        diffusion = sigma * np.sqrt(hold_T_eff) * Z
-        S_h = S0 * np.exp(drift + diffusion)
-
-        # 2. Simulate IV at Horizon (Random Walk Consistency)
-        aiv_is_10d = bool(getattr(self.cfg, "aiv_is_10day_change", False))
-        aiv_h = aiv * (steps_eff / 10.0) if aiv_is_10d else aiv
-
-        iv_daily_std = float(getattr(self.cfg, "iv_daily_std", 0.01))
-        iv_noise_h = np.random.normal(0.0, iv_daily_std * np.sqrt(steps_eff), self.num_paths)
-
-        IV_h = IV0 + aiv_h + iv_noise_h
-
-        # Apply min/cap
-        iv_min = float(getattr(self.cfg, "iv_min", 0.01))
-        iv_max = getattr(self.cfg, "iv_max", 3.0)
-        if iv_max is None:
-            IV_h = np.maximum(iv_min, IV_h)
+        # 1. Setup Time Context
+        if trade_date:
+            current_date = pd.Timestamp(trade_date)
         else:
-            IV_h = np.clip(IV_h, iv_min, float(iv_max))
+            current_date = pd.Timestamp.now()
 
-        # 3. Price
-        terminal_vals = self._black_scholes_vectorized(S_h, K, r, T_rem, IV_h, is_call)
+        # Extract Candidate Data
+        economics = candidate.get('economics', {})
+        strategy = candidate.get('strategy', 'SINGLE_PUT')
+        legs = candidate.get('legs', [])
 
-        # 4. Apply Slippage (simulating selling at the horizon)
-        fill_mult = 1.0 - float(self.cfg.slippage_pct)
-        terminal_vals = terminal_vals * fill_mult
+        if not legs: return {}
 
-        pnl = terminal_vals - entry_price
-        return self._compute_stats(pnl, terminal_vals)
+        # Risk bounds (P1 Compliance: Use explicit bounds from Generator)
+        max_gain = economics.get('max_gain', float('inf'))
+        max_loss = economics.get('max_loss', entry_cost)
 
-    # ----------------------------------------------------------------
-    # 3. STATS & MATH
-    # ----------------------------------------------------------------
-    def _compute_stats(self, pnl, terminal_vals):
-        """Comprehensive stats for sanity checking."""
-        stats = {
-            "expected_pnl": float(np.mean(pnl)),
-            "expected_option_price": float(np.mean(terminal_vals)),
-            "prob_profit": float(np.mean(pnl > 0)),
-            "VaR_95": float(np.percentile(pnl, 5)),
-            "p10_value": float(np.percentile(terminal_vals, 10)),
-            "p90_value": float(np.percentile(terminal_vals, 90)),
+        # Volatility & Drift (Simplified for now - can be connected to Fusion Model later)
+        # Using a fixed annual vol of 50% for TSLA paper trading if not provided
+        sigma = candidate.get('implied_volatility', 0.50)
+        mu = 0.05  # Conservative 5% annual drift
+
+        # Time to Expiration (FIX: Relative to trade_date)
+        expiration = pd.to_datetime(legs[0]['expiration'])
+        dte = (expiration - current_date).days
+
+        # Safety: If trading 0-DTE or negative (data error), clamp to 1 day
+        if dte < 1: dte = 1
+        T = dte / 365.0
+
+        # 2. Simulate Paths (Geometric Brownian Motion)
+        # S_T = S_0 * exp((mu - 0.5*sigma^2)*T + sigma*sqrt(T)*Z)
+        Z = np.random.standard_normal(self.n_sims)
+        ST = current_price * np.exp((mu - 0.5 * sigma ** 2) * T + sigma * np.sqrt(T) * Z)
+
+        # 3. Calculate Payoff at Expiration
+        pnl_outcomes = []
+
+        if 'SPREAD' in strategy or 'VERTICAL' in strategy:
+            # Vertical Spread Logic
+            long_strike = legs[0]['strike']
+            short_strike = legs[1]['strike']
+
+            # Put Debit Spread Value = Max(0, Long_Strike - ST) - Max(0, Short_Strike - ST)
+            spread_value = np.maximum(0, long_strike - ST) - np.maximum(0, short_strike - ST)
+
+            # PnL = Final Value - Entry Cost
+            pnl_outcomes = spread_value - entry_cost
+
+        else:
+            # Single Put Logic
+            strike = legs[0]['strike']
+            option_value = np.maximum(0, strike - ST)
+            pnl_outcomes = option_value - entry_cost
+
+        # 4. PRIORITY 1: Hard Clamp (Safety Net)
+        # Ensure floating point math didn't exceed bounds defined by the Generator
+        pnl_outcomes = np.clip(pnl_outcomes, -max_loss, max_gain)
+
+        # 5. Calculate Metrics
+        expected_pnl = np.mean(pnl_outcomes)
+        prob_profit = np.mean(pnl_outcomes > 0)
+
+        # Downside Risk Metrics
+        losses = pnl_outcomes[pnl_outcomes < 0]
+
+        # VaR (95%)
+        if len(pnl_outcomes) > 0:
+            var_95 = np.percentile(pnl_outcomes, 5)  # 5th percentile (negative number)
+        else:
+            var_95 = -max_loss
+
+        # CVaR (95%) - PRIORITY 1 FIX
+        # Average of losses worse than VaR (The "Tail Risk")
+        tail_losses = pnl_outcomes[pnl_outcomes <= var_95]
+        if len(tail_losses) > 0:
+            cvar_95 = np.mean(tail_losses)
+        else:
+            cvar_95 = var_95
+
+        # Downside Sharpe (Sortino-ish)
+        downside_std = np.std(losses) if len(losses) > 0 else 1.0
+        downside_sharpe = expected_pnl / downside_std if downside_std > 0 else 0
+
+        return {
+            'expected_pnl': expected_pnl,
+            'prob_profit': prob_profit,
+            'VaR95': var_95,
+            'CVaR95': cvar_95,  # New Metric
+            'downside_sharpe': downside_sharpe,
+            'simulated_price_mean': np.mean(ST),
+            'drift': mu
         }
-
-        # Sharpe Calculations
-        mean_pnl = np.mean(pnl)
-        std_pnl = np.std(pnl)
-
-        # MC Sharpe (Mean / Std)
-        stats["mc_sharpe"] = float(mean_pnl / std_pnl) if std_pnl > 1e-6 else 0.0
-
-        # Downside Sharpe (Mean / Downside Deviation)
-        negative = pnl[pnl < 0]
-        downside_dev = np.sqrt(np.mean(negative ** 2)) if len(negative) > 0 else 1e-6
-        stats["downside_sharpe"] = float(mean_pnl / downside_dev)
-
-        return stats
-
-    def _black_scholes_matrix(self, S, K, r, T_vec, sigma, is_call):
-        T = T_vec[None, :]
-        sigma = np.maximum(sigma, 1e-8)
-        intrinsic = np.maximum(0.0, (S - K) if is_call else (K - S))
-        near0 = (T <= 1e-8)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            sqrtT = np.sqrt(np.maximum(T, 1e-16))
-            d1 = (np.log(np.maximum(S, 1e-16) / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * sqrtT)
-            d2 = d1 - sigma * sqrtT
-        if is_call:
-            price = S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
-        else:
-            price = K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
-        return np.where(near0, intrinsic, price)
-
-    def _black_scholes_vectorized(self, S, K, r, T, sigma, is_call):
-        # Handles scalar or vector T
-        if np.isscalar(T) and T <= 1e-8:
-            return np.maximum(0.0, (S - K) if is_call else (K - S))
-        sigma = np.maximum(sigma, 1e-8)
-        with np.errstate(divide='ignore', invalid='ignore'):
-            d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
-            d2 = d1 - sigma * np.sqrt(T)
-        if not np.isscalar(T):
-            d1 = np.where(T > 1e-8, d1, 0.0)
-            d2 = np.where(T > 1e-8, d2, 0.0)
-        if is_call:
-            price = S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
-        else:
-            price = K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
-        if not np.isscalar(T):
-            price = np.where(T <= 1e-8, np.maximum(0.0, (S - K) if is_call else (K - S)), price)
-        return price
-
-    def _black_scholes_single(self, S, K, r, T, sigma, is_call):
-        if T <= 1e-8: return max(0.0, (S - K) if is_call else (K - S))
-        d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
-        d2 = d1 - sigma * np.sqrt(T)
-        if is_call: return S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
-        return K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)

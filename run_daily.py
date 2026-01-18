@@ -1,443 +1,202 @@
-"""
-run_daily.py
-============
-Daily orchestration script for the TSLA options trading system.
-UPDATED: Symbols set to CUSTOM format (TSLA260213P445.0) for compatibility.
-"""
-
 import os
 import sys
-from datetime import datetime, date, timedelta
 import pandas as pd
-import numpy as np
-import yfinance as yf
+import logging
+from datetime import datetime
 
-# ============================================================
-# 2. CONFIGURATION
-# ============================================================
-LOGS_DIR = r"C:\My Documents\Mics\Logs"
-CATALOG_FILE = os.path.join(LOGS_DIR, "TSLA_Options_Contracts.csv")
-LEDGER_FILE = os.path.join(LOGS_DIR, "paper_trade_ledger.csv")
-
-UNDERLYING_SYMBOL = "TSLA"
-RISK_FREE_RATE = 0.04
-NUM_MC_PATHS = 50_000
-MAX_CANDIDATES = 20
-FAIRNESS_CHECK_MODE = False
-BASE_SEED = 42
-N_SEEDS = 5
-MODEL_VERSION = "Fusion_v1.0"
-
-# ============================================================
-# 3. PATH & IMPORTS
-# ============================================================
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(os.path.join(PROJECT_ROOT, "CandidateGenerator"))
-sys.path.append(os.path.join(PROJECT_ROOT, "MarketStateAdapter"))
-sys.path.append(os.path.join(PROJECT_ROOT, "Montecarlo_Sharpe"))
-sys.path.append(os.path.join(PROJECT_ROOT, "TradeDecisionBuilder"))
-sys.path.append(os.path.join(PROJECT_ROOT, "MLPTrainer"))
-sys.path.append(os.path.join(PROJECT_ROOT, "Helpers"))
-
+# --- 1. CONFIGURATION IMPORT ---
 try:
-    from candidate_generator import CandidateGenerator, GeneratorConfig
-    from market_state_adapter import MarketStateAdapter
-    from MonteCarloEngine import MonteCarloEngine, ExitRules
-    from TradeDecisionBuilder import TradeDecisionBuilder, DecisionType
-    from FusionPredictor import FusionPredictor
-    from paper_helpers import run_candidate_multi_seed, append_ledger_rows, ensure_ledger_schema, make_run_id
+    from config import Config
+except ImportError:
+    print("CRITICAL ERROR: 'config.py' not found. Please ensure it exists in the project root.")
+    sys.exit(1)
+
+# --- 2. MODULE IMPORTS ---
+try:
+    # 1. Candidate Generator
+    from CandidateGenerator.candidate_generator import CandidateGenerator
+
+    # 2. Trade Decision Builder (Robust Import)
+    try:
+        from TradeDecisionBuilder.trade_decision_builder import TradeDecisionBuilder
+    except ImportError:
+        from TradeDecisionBuilder.TradeDecisionBuilder import TradeDecisionBuilder
+
+    # 3. Monte Carlo Engine
+    from Montecarlo_Sharpe.monte_carlo_engine import MonteCarloEngine
+
 except ImportError as e:
     print(f"CRITICAL IMPORT ERROR: {e}")
     sys.exit(1)
 
 
-# ============================================================
-# HELPER: CUSTOM SYMBOL GENERATOR
-# ============================================================
-def get_occ_symbol(underlying, expiration, op_type, strike):
-    """
-    Generates CUSTOM Symbol Format: Root + YYMMDD + Type + Strike(float string)
-    Example: TSLA260213P445.0
-    """
-    try:
-        dt = pd.to_datetime(expiration)
-        yymmdd = dt.strftime('%y%m%d')
-        type_char = 'C' if op_type.upper() == 'CALL' else 'P'
+# --- 3. LOGGING SETUP ---
+def setup_logging():
+    log_filename = os.path.join(Config.LOGS_DIR, "daily_pipeline.log")
 
-        # FORCE Custom Format: 445 -> "445.0"
-        strike_str = str(float(strike))
-
-        root = underlying.strip().upper()
-        return f"{root}{yymmdd}{type_char}{strike_str}"
-    except Exception:
-        # Fallback
-        return f"{underlying}_{op_type}_{strike}_{expiration}"
+    logging.basicConfig(
+        level=logging.DEBUG if Config.DEBUG_MODE else logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_filename, mode='a'),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    logging.info(f"--- STARTING DAILY RUN (ENV: {Config.APP_ENV}) ---")
+    logging.info(f"Target Ticker: {Config.UNDERLYING_SYMBOL}")
 
 
-# ============================================================
-# MAIN EXECUTION
-# ============================================================
+def main():
+    setup_logging()
 
-# 1. LOAD DATA (ROBUST VERSION)
-print(f"\nLoading catalog from: {CATALOG_FILE}")
-if not os.path.exists(CATALOG_FILE):
-    raise FileNotFoundError(f"Catalog not found: {CATALOG_FILE}")
+    # --- 4. PATH SETUP (DYNAMIC) ---
+    symbol = Config.UNDERLYING_SYMBOL
 
-catalog = pd.read_csv(CATALOG_FILE, low_memory=False)
+    # Input Files
+    CATALOG_FILE = os.path.join(Config.DATA_DIR, f"{symbol}_Options_Contracts.csv")
+    DAILY_FILE = os.path.join(Config.DATA_DIR, f"{symbol.lower()}_daily.csv")
 
-# Robust Date Parsing
-catalog["date"] = pd.to_datetime(catalog["date"], errors='coerce')
-catalog = catalog.dropna(subset=['date'])
-catalog["date"] = catalog["date"].dt.date
+    # Output File
+    LEDGER_FILE = Config.DB_FILE
 
-if "expiration" in catalog.columns:
-    catalog["expiration"] = pd.to_datetime(catalog["expiration"], errors='coerce')
-
-today = date.today()
-available_dates = sorted(d for d in catalog["date"].unique() if pd.notna(d) and d <= today)
-
-if not available_dates:
-    raise RuntimeError("No valid dates found in catalog.")
-
-TRADE_DATE = available_dates[-1]
-print(f"Target Trade Date Resolved: {TRADE_DATE}")
-
-# Staleness Check
-days_lag = (today - TRADE_DATE).days
-if days_lag > 3:
-    print(f"\n[CRITICAL ERROR] Data is stale by {days_lag} days!")
-    print(f"  Latest available date: {TRADE_DATE}")
-    sys.exit(1)
-
-catalog_today = catalog[catalog["date"] == TRADE_DATE].copy()
-catalog_today["row_id"] = catalog_today.index
-
-# --- INJECT UNDERLYING PRICE (ROBUST) ---
-print(f"Fetching {UNDERLYING_SYMBOL} price for {TRADE_DATE} via yfinance...")
-found_price = False
-spot_price = 0.0
-
-try:
-    start_dt = pd.Timestamp(TRADE_DATE)
-    end_dt = start_dt + timedelta(days=2)
-
-    ticker = yf.Ticker(UNDERLYING_SYMBOL)
-    hist = ticker.history(start=start_dt, end=end_dt)
-
-    if not hist.empty:
-        hist.index = hist.index.date
-        if TRADE_DATE in hist.index:
-            spot_price = float(hist.loc[TRADE_DATE]['Close'])
-            print(f"  ✅ Found Close Price: ${spot_price:.2f}")
-            found_price = True
-        else:
-            spot_price = float(hist['Close'].iloc[0])
-            print(f"  ⚠️ Exact date match failed. Using closest: ${spot_price:.2f}")
-            found_price = True
-    else:
-        print("  ❌ yfinance returned no data.")
-
-except Exception as e:
-    print(f"  ❌ Price Fetch Failed: {e}")
-
-if found_price and spot_price > 0:
-    catalog_today['underlying_price'] = spot_price
-else:
-    # FALLBACK: Check if catalog already has a valid price
-    if "underlying_price" in catalog_today.columns:
-        valid_prices = catalog_today[catalog_today["underlying_price"] > 0]["underlying_price"]
-        if not valid_prices.empty:
-            fallback_price = valid_prices.median()
-            print(f"  ⚠️ Using median price from catalog: ${fallback_price:.2f}")
-            catalog_today['underlying_price'] = fallback_price
-        else:
-            print("[CRITICAL] No valid underlying price found in YFinance OR Catalog. Aborting.")
-            sys.exit(1)
-    else:
-        print("[CRITICAL] underlying_price column missing and YFinance failed. Aborting.")
+    # Validate Inputs
+    if not os.path.exists(CATALOG_FILE):
+        logging.error(f"Catalog not found: {CATALOG_FILE}")
+        sys.exit(1)
+    if not os.path.exists(DAILY_FILE):
+        logging.error(f"Daily data not found: {DAILY_FILE}")
         sys.exit(1)
 
-# 2. GENERATE CANDIDATES
-print(f"\nGenerating candidates...")
-
-try:
-    gen_config = GeneratorConfig(
-        min_dte=7,
-        max_dte=45,
-        max_candidates=MAX_CANDIDATES,
-        min_vol=1,  # Relaxed volume filter
-        min_oi=100
-    )
-    generator = CandidateGenerator(gen_config)
-except TypeError:
-    print("Warning: Using Default CandidateGenerator.")
-    generator = CandidateGenerator()
-
-candidates = generator.generate(catalog_today, trade_date=str(TRADE_DATE))
-print(f"Generated {len(candidates)} candidates.")
-
-if not candidates:
-    print("No candidates met the criteria.")
-    sys.exit(0)
-
-# 3. PREDICT
-print("\nRunning Fusion Model Inference...")
-try:
-    predictor = FusionPredictor(base_dir=LOGS_DIR)
-    fusion_output = predictor.predict(str(TRADE_DATE))
-
-    raw_mu_log = fusion_output['mu']
-    raw_sigma = fusion_output['sigma']
-    raw_aiv = fusion_output['aiv']
-
-    mu_arithmetic = raw_mu_log + 0.5 * (raw_sigma ** 2)
-    fusion_output['mu'] = mu_arithmetic
-
-    print(f"  -> Model Prediction: Adj. Mu {mu_arithmetic:.4f} | Sigma {raw_sigma:.4f}")
-
-except Exception as e:
-    print(f"  ⚠️ PREDICTION FAILED: {e}")
-    print("  -> ACTION: Switching to FALLBACK MODE (Neutral Assumptions)")
-
-    # Define variables to avoid NameError later
-    raw_mu_log = RISK_FREE_RATE
-    raw_sigma = 0.40
-    raw_aiv = 0.0
-
-    fusion_output = {
-        'mu': raw_mu_log,
-        'sigma': raw_sigma,
-        'aiv': raw_aiv
-    }
-    fusion_output['mu'] = raw_mu_log + 0.5 * (raw_sigma ** 2)
-
-    print(f"  -> Fallback: Mu {fusion_output['mu']:.4f} | Sigma {fusion_output['sigma']:.4f}")
-
-# 4. SIMULATE & DECIDE
-print(f"\nStarting Evaluation ({NUM_MC_PATHS} paths x {N_SEEDS} seeds)...")
-
-exit_rules = ExitRules(
-    use_path_exits=True,
-    hold_days=14,
-    take_profit_pct=0.80,
-    stop_loss_pct=0.50,
-    be_trigger_pct=0.25,
-    be_exit_buffer=0.01,
-    slippage_pct=0.01
-)
-
-mc_engine = MonteCarloEngine(num_paths=NUM_MC_PATHS, exit_config=exit_rules)
-decision_builder = TradeDecisionBuilder()
-adapter = MarketStateAdapter(risk_free_rate=RISK_FREE_RATE)
-pred_mu = fusion_output['mu']
-
-RUN_ID = make_run_id()
-all_ledger_rows = []
-accepted_trades = []
-
-ledger_headers = [
-    "run_id", "timestamp", "trade_date", "row_id", "model_version",
-    "type", "strike", "dte", "expiration", "contractID",
-    "S0", "IV0", "entry_price", "bid", "ask", "spread_pct", "volume", "open_interest",
-    "mu_log_raw", "sigma_raw", "aiv_10d", "mu_arith_adj",
-    "hold_days", "mc_mode", "year_days", "iv_daily_std", "iv_min", "iv_max", "slippage",
-    "tp_pct", "sl_pct", "be_pct", "be_buffer",
-    "expected_pnl", "prob_profit", "downside_sharpe", "mc_sharpe", "VaR95", "expected_opt_price",
-    "expected_pnl_std", "prob_profit_std", "downside_sharpe_std", "VaR95_std",
-    "p10_value", "p90_value", "avg_exit_day",
-    "TP_rate", "SL_rate", "BE_rate", "Hold_rate",
-    "decision", "reason", "seed_type", "seed_val"
-]
-
-ensure_ledger_schema(LEDGER_FILE, ledger_headers)
-
-for idx, candidate in enumerate(candidates, start=1):
+    # --- 5. LOAD MARKET CONTEXT ---
+    logging.info("Loading market data...")
     try:
-        if hasattr(adapter, 'adapt'):
-            market_state = adapter.adapt(candidate)
-        else:
-            market_state = adapter.build_market_state(candidate)
-        market_state['r'] = RISK_FREE_RATE
+        df_daily = pd.read_csv(DAILY_FILE)
 
-        leg = candidate['legs'][0]
-        cand_type = leg['type'].upper()
-        strike = leg['strike']
-        dte = leg['dte']
-        rid = leg.get('row_id', -1)
-        expiration = leg['expiration']
+        # Robust Column Normalization
+        df_daily.columns = [c.lower().strip() for c in df_daily.columns]
+        col_map = {c: 'close' for c in df_daily.columns if 'close' in c}
+        col_map.update({c: 'date' for c in df_daily.columns if 'date' in c or 'timestamp' in c})
+        if col_map: df_daily.rename(columns=col_map, inplace=True)
 
-        bid = leg.get('bid', 0.0)
-        ask = leg.get('ask', 0.0)
-        vol = leg.get('volume', 0)
-        oi = leg.get('open_interest', 0)
-        entry_price = market_state.get('price', 0.0)
-        mid_price = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else entry_price
+        if 'close' not in df_daily.columns:
+            raise KeyError("Column 'close' missing from daily data.")
 
-        # --- SYMBOL GENERATION ---
-        # Prioritize existing ID, else use CUSTOM GENERATOR
-        contract_id = leg.get("contractID")
-        if not contract_id:
-            contract_id = get_occ_symbol(UNDERLYING_SYMBOL, expiration, cand_type, strike)
+        current_price = df_daily['close'].iloc[-1]
 
-        # Spread on Mid
-        denom = mid_price if mid_price > 0 else entry_price
-        spread_pct = (ask - bid) / denom if denom > 0 else 0.0
+        # Get Trade Date (Critical for Backtesting)
+        trade_date = df_daily['date'].iloc[-1] if 'date' in df_daily.columns else datetime.now().strftime('%Y-%m-%d')
 
-        base_row = {
-            "run_id": RUN_ID,
-            "timestamp": datetime.now().isoformat(),
-            "trade_date": str(TRADE_DATE),
-            "row_id": rid,
-            "model_version": MODEL_VERSION,
-            "type": cand_type,
-            "strike": strike,
-            "dte": dte,
-            "expiration": expiration,
-            "contractID": contract_id,
-            "S0": f"{market_state['S']:.2f}",
-            "IV0": f"{market_state['IV']:.4f}",
-            "entry_price": f"{entry_price:.2f}",
-            "bid": f"{bid:.2f}", "ask": f"{ask:.2f}",
-            "spread_pct": f"{spread_pct:.4f}",
-            "volume": vol, "open_interest": oi,
-            "mu_log_raw": f"{raw_mu_log:.4f}",
-            "sigma_raw": f"{raw_sigma:.4f}",
-            "aiv_10d": f"{raw_aiv:.4f}",
-            "mu_arith_adj": f"{pred_mu:.4f}",
-            "hold_days": exit_rules.hold_days,
-            "mc_mode": "PATH" if exit_rules.use_path_exits else "TERMINAL",
-            "year_days": exit_rules.year_days,
-            "iv_daily_std": exit_rules.iv_daily_std,
-            "iv_min": exit_rules.iv_min, "iv_max": exit_rules.iv_max,
-            "slippage": exit_rules.slippage_pct,
-            "tp_pct": exit_rules.take_profit_pct, "sl_pct": exit_rules.stop_loss_pct,
-            "be_pct": exit_rules.be_trigger_pct, "be_buffer": exit_rules.be_exit_buffer
-        }
-
-        # --- DIRECTIONAL PRE-FILTER ---
-        skipped = False
-        skip_reason = ""
-        if not FAIRNESS_CHECK_MODE:
-            if pred_mu < 0 and cand_type == 'CALL':
-                skipped = True;
-                skip_reason = "CALL vs Bearish Signal"
-            if pred_mu > 0 and cand_type == 'PUT':
-                skipped = True;
-                skip_reason = "PUT vs Bullish Signal"
-
-        if skipped:
-            print(f"  [Candidate {idx}] SKIPPED ({skip_reason})")
-            # Log SKIP
-            skip_row = base_row.copy()
-            skip_row.update({
-                "decision": "SKIP",
-                "reason": skip_reason,
-                "seed_type": "N/A", "seed_val": "N/A",
-                "expected_pnl": 0, "prob_profit": 0, "downside_sharpe": 0
-            })
-            all_ledger_rows.append(skip_row)
-            continue
-
-        # --- SIMULATION ---
-        per_seed_rows, agg = run_candidate_multi_seed(
-            mc_engine, fusion_output, market_state,
-            contract_id=contract_id,
-            base_seed=BASE_SEED,
-            n_seeds=N_SEEDS
-        )
-
-        decision = decision_builder.build_decision(
-            expected_pnl=agg['expected_pnl_mean'],
-            prob_profit=agg['prob_profit_mean'],
-            downside_sharpe=agg['downside_sharpe_mean'],
-            cvar=agg['VaR_95_mean'],
-            premium=entry_price,
-            downside_sharpe_std=agg['downside_sharpe_std'],
-            volatility_consistent=True,
-            no_macro_events=True,
-            system_healthy=True
-        )
-
-        status = "✅ ACCEPT" if decision.decision == DecisionType.TRADE else "❌ REJECT"
-        print(f"  [Candidate {idx}] {status} | {contract_id}")
-
-        if decision.decision == DecisionType.TRADE:
-            composite_score = agg['downside_sharpe_mean'] - (0.5 * agg['downside_sharpe_std'])
-            if abs(agg['VaR_95_mean']) > 1e-6:
-                composite_score += 0.2 * (agg['expected_pnl_mean'] / abs(agg['VaR_95_mean']))
-
-            accepted_trades.append({
-                "id": contract_id,
-                "desc": f"{cand_type} {strike} DTE {dte}",
-                "score": composite_score,
-                "ds": agg['downside_sharpe_mean'],
-                "ev": agg['expected_pnl_mean'],
-                "var": agg['VaR_95_mean']
-            })
-
-        # Add Per-Seed Rows
-        for r in per_seed_rows:
-            full_row = base_row.copy()
-            full_row.update({
-                "seed_type": "INDIVIDUAL",
-                "seed_val": r["seed_val"],
-                "decision": "N/A", "reason": "N/A",
-                "expected_pnl": f"{r['expected_pnl']:.4f}",
-                "prob_profit": f"{r['prob_profit']:.4f}",
-                "downside_sharpe": f"{r['downside_sharpe']:.4f}",
-                "mc_sharpe": f"{r['mc_sharpe']:.4f}",
-                "VaR95": f"{r['VaR_95']:.4f}",
-                "expected_opt_price": f"{r['expected_option_price']:.4f}",
-                "p10_value": f"{r['p10_value']:.4f}", "p90_value": f"{r['p90_value']:.4f}",
-                "TP_rate": r.get("exit_rate_tp", 0), "SL_rate": r.get("exit_rate_sl", 0),
-                "BE_rate": r.get("exit_rate_be", 0), "Hold_rate": r.get("hold_rate", 0),
-                "avg_exit_day": r.get("exit_day_mean", 0)
-            })
-            all_ledger_rows.append(full_row)
-
-        # Add Aggregate Row
-        agg_row = base_row.copy()
-        agg_row.update({
-            "seed_type": "AGGREGATE",
-            "seed_val": "MEAN",
-            "decision": decision.decision.value,
-            "reason": decision.reason,
-            "expected_pnl": f"{agg['expected_pnl_mean']:.4f}",
-            "prob_profit": f"{agg['prob_profit_mean']:.4f}",
-            "downside_sharpe": f"{agg['downside_sharpe_mean']:.4f}",
-            "mc_sharpe": f"{agg['mc_sharpe_mean']:.4f}",
-            "VaR95": f"{agg['VaR_95_mean']:.4f}",
-            "expected_opt_price": f"{agg['expected_option_price_mean']:.4f}",
-            "p10_value": f"{agg['p10_value_mean']:.4f}", "p90_value": f"{agg['p90_value_mean']:.4f}",
-            "expected_pnl_std": f"{agg['expected_pnl_std']:.4f}",
-            "prob_profit_std": f"{agg['prob_profit_std']:.4f}",
-            "downside_sharpe_std": f"{agg['downside_sharpe_std']:.4f}",
-            "VaR95_std": f"{agg['VaR_95_std']:.4f}",
-            "TP_rate": f"{agg.get('exit_rate_tp_mean', 0):.2f}",
-            "SL_rate": f"{agg.get('exit_rate_sl_mean', 0):.2f}",
-            "BE_rate": f"{agg.get('exit_rate_be_mean', 0):.2f}",
-            "Hold_rate": f"{agg.get('hold_rate_mean', 0):.2f}",
-            "avg_exit_day": f"{agg.get('exit_day_mean_mean', 0):.1f}"
-        })
-        all_ledger_rows.append(agg_row)
+        logging.info(f"Market Context: Date={trade_date}, S0=${current_price:.2f}")
 
     except Exception as e:
-        print(f"  [Candidate {idx}] Failed: {e}")
+        logging.error(f"CRITICAL DATA FAILURE: {e}")
+        sys.exit(1)
 
-# WRITE LEDGER BATCH
-if all_ledger_rows:
-    append_ledger_rows(LEDGER_FILE, all_ledger_rows, headers=ledger_headers)
-    print(f"\n[LEDGER] Saved {len(all_ledger_rows)} rows to {LEDGER_FILE}")
+    # --- 6. GENERATE CANDIDATES ---
+    logging.info("Initializing Candidate Generator...")
 
-# SUMMARY
-if accepted_trades:
-    print("\n" + "=" * 80)
-    print("🏆 TOP ACCEPTED TRADES")
-    print("=" * 80)
-    accepted_trades.sort(key=lambda x: x['score'], reverse=True)
-    for rank, t in enumerate(accepted_trades, start=1):
-        print(f"#{rank} {t['id']} | Score: {t['score']:.4f} | EV: ${t['ev']:.2f}")
-else:
-    print("\n⚠️  NO TRADES ACCEPTED TODAY")
+    # Pass trade_date for correct DTE calculation
+    generator = CandidateGenerator(
+        catalog_path=CATALOG_FILE,
+        current_price=current_price,
+        trade_date=trade_date
+    )
 
-print("\nDaily orchestration complete.")
+    candidates = generator.generate_candidates()
+    logging.info(f"Generated {len(candidates)} candidates.")
+
+    # --- 7. INITIALIZE ENGINES ---
+    mc_engine = MonteCarloEngine()
+    decision_builder = TradeDecisionBuilder()
+
+    ledger_entries = []
+
+    # --- 8. MAIN ANALYSIS LOOP ---
+    for i, candidate in enumerate(candidates):
+        try:
+            # --- A. EXTRACT PRE-CALCULATED ECONOMICS ---
+            contract_id = candidate.get('contractID', 'UNKNOWN')
+            structure_type = candidate.get('strategy', 'UNKNOWN')
+
+            economics = candidate.get('economics', {})
+            entry_cost = economics.get('entry_cost', 0.0)
+            max_loss = economics.get('max_loss', 0.0)  # <--- EXTRACTED HERE
+
+            # Display Metadata
+            legs = candidate.get('legs', [])
+            if len(legs) == 2:
+                strike_display = f"{legs[0]['strike']}/{legs[1]['strike']}"
+                expiration = legs[0]['expiration']
+            elif len(legs) == 1:
+                strike_display = str(legs[0]['strike'])
+                expiration = legs[0]['expiration']
+            else:
+                logging.warning(f"Skipping {contract_id}: Odd leg count ({len(legs)})")
+                continue
+
+            logging.info(f"Analyzing {contract_id} (Cost: ${entry_cost:.2f})...")
+
+            # --- B. RUN MONTE CARLO SIMULATION ---
+            # Pass trade_date for correct DTE
+            mc_result = mc_engine.analyze(
+                candidate,
+                current_price,
+                entry_cost,
+                trade_date=trade_date
+            )
+
+            # --- C. BUILD TRADE DECISION ---
+            # FIX: Pass max_loss explicitely for "Binary Gamble" check
+            decision_result = decision_builder.evaluate(mc_result, max_loss=max_loss)
+
+            # --- D. PREPARE LEDGER ENTRY ---
+            entry = {
+                'timestamp': datetime.now().isoformat(),
+                'trade_date': trade_date,
+                'contractID': contract_id,
+                'type': structure_type,
+                'strike': strike_display,
+                'expiration': expiration,
+                'entry_price': entry_cost,
+                'max_loss': max_loss,
+                'decision': decision_result.get('decision', 'ERROR'),
+                'reason': decision_result.get('reason', 'Unknown'),
+
+                # MC Metrics
+                'expected_pnl': round(mc_result.get('expected_pnl', 0), 2),
+                'prob_profit': round(mc_result.get('prob_profit', 0), 4),
+                'downside_sharpe': round(mc_result.get('downside_sharpe', 0), 4),
+                'VaR95': round(mc_result.get('VaR95', 0), 2),
+                'CVaR95': round(mc_result.get('CVaR95', 0), 2)
+            }
+
+            ledger_entries.append(entry)
+            logging.info(f"-> Decision: {entry['decision']} | Reason: {entry['reason']}")
+
+        except Exception as e:
+            logging.error(f"Error processing candidate {i}: {e}", exc_info=True)
+            continue
+
+    # --- 9. SAVE TO LEDGER ---
+    if ledger_entries:
+        df_new = pd.DataFrame(ledger_entries)
+
+        if os.path.exists(LEDGER_FILE):
+            try:
+                df_old = pd.read_csv(LEDGER_FILE)
+                # Align columns
+                df_final = pd.concat([df_old, df_new], ignore_index=True)
+            except pd.errors.EmptyDataError:
+                df_final = df_new
+        else:
+            df_final = df_new
+
+        df_final.to_csv(LEDGER_FILE, index=False)
+        logging.info(f"--- [STEP SUCCESS] 5. Daily Strategy Execution ---")
+        logging.info(f"[LEDGER] Saved {len(df_new)} rows to {LEDGER_FILE}")
+    else:
+        logging.warning("No candidates processed.")
+
+
+if __name__ == "__main__":
+    main()
