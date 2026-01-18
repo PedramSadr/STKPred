@@ -3,7 +3,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
+import os
 from sklearn.preprocessing import MinMaxScaler
+
+# Default input directory
+DEFAULT_INPUT_DIR = r"C:\My Documents\Mics\Logs"
 
 #
 # This Code Performs Monte Carlo Simulations to Predict TSLA Stock Prices
@@ -11,7 +15,8 @@ from sklearn.preprocessing import MinMaxScaler
 #
 
 # 1. Read CSV file and prepare data
-df = pd.read_csv(r'C:\My Documents\Mics\Logs\tsla_monte.csv')
+csv_path = os.path.join(DEFAULT_INPUT_DIR, 'tsla_monte.csv')
+df = pd.read_csv(csv_path)
 df['Date'] = pd.to_datetime(df['Date'])
 df = df.sort_values('Date').set_index('Date')
 
@@ -85,7 +90,7 @@ scaler = MinMaxScaler()
 features_scaled = scaler.fit_transform(features)
 
 SEQ_LENGTH = 7  # Use the same as in training
-MODEL_PATH = r'C:\My Documents\Mics\Logs\tsla_lstm_model_final.pth'
+MODEL_PATH = os.path.join(DEFAULT_INPUT_DIR, 'tsla_lstm_model_final.pth')
 
 # 2. Load LSTM model
 model = LSTMModel(input_size=len(feature_cols), hidden_size=81, num_layers=1, output_size=1)

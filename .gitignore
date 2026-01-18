@@ -1,0 +1,27 @@
+# --- Python Bytecode & Cache ---
+# This matches __pycache__ in any subdirectory (CandidateGenerator, Helpers, etc.)
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Logs ---
+# Ignores the specific log file you mentioned
+daily_pipeline.log
+# Optional: Ignore all log files
+*.log
+
+# --- Virtual Environments ---
+# Based on our previous setup, we should ignore these folders
+venv_prod/
+venv_dev/
+venv/
+env/
+
+# --- IDE Settings (Optional but recommended for PyCharm) ---
+.idea/
+
+# --- Data & Config (Optional) ---
+# If you want to prevent committing your local CSV data or keys
+*.csv
+config.py
+.env
