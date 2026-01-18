@@ -2,7 +2,7 @@ import os
 import sys
 import pandas as pd
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # --- 1. CONFIGURATION IMPORT ---
 try:
@@ -23,7 +23,14 @@ try:
         from TradeDecisionBuilder.TradeDecisionBuilder import TradeDecisionBuilder
 
     # 3. Monte Carlo Engine
-    from Montecarlo_Sharpe.monte_carlo_engine import MonteCarloEngine
+    from Montecarlo_Sharpe.MonteCarloEngine import MonteCarloEngine
+
+    # 4. Trade Manager (Lifecycle & Exits)
+    try:
+        from TradeManager.trade_manager import TradeManager
+    except ImportError:
+        logging.warning("TradeManager not found. Exit logic will be skipped.")
+        TradeManager = None
 
 except ImportError as e:
     print(f"CRITICAL IMPORT ERROR: {e}")
@@ -92,8 +99,32 @@ def main():
         logging.error(f"CRITICAL DATA FAILURE: {e}")
         sys.exit(1)
 
+    # --- 5.5 EXIT MANAGEMENT (LIFECYCLE CHECK) ---
+    # This step delegates exit decisions to the TradeManager.
+    if TradeManager:
+        logging.info("--- CHECKING EXITS (SIMULATION) ---")
+        trade_manager = TradeManager()
+
+        # TODO: In Phase 2, load real 'open_positions.csv' here.
+        # For now, we simulate checking a mock trade to validate the architecture.
+        # Example: A trade expiring in 18 days (Should trigger TIME_STOP if rule is 21)
+        mock_trade_expiry = (pd.Timestamp(trade_date) + timedelta(days=18)).strftime('%Y-%m-%d')
+        mock_trade = {
+            'contractID': 'MOCK_TEST_SPREAD',
+            'expiration': mock_trade_expiry
+        }
+
+        exit_decision = trade_manager.check_exit(mock_trade, trade_date)
+
+        if exit_decision['action'] == 'EXIT':
+            logging.info(f"[EXIT SIGNAL] {mock_trade['contractID']} -> {exit_decision['reason']}")
+        else:
+            logging.info(f"[HOLD] {mock_trade['contractID']} -> {exit_decision['reason']}")
+    else:
+        logging.info("--- SKIPPING EXITS (Manager Not Found) ---")
+
     # --- 6. GENERATE CANDIDATES ---
-    logging.info("Initializing Candidate Generator...")
+    logging.info("--- GENERATING NEW ENTRIES ---")
 
     # Pass trade_date for correct DTE calculation
     generator = CandidateGenerator(
@@ -120,7 +151,9 @@ def main():
 
             economics = candidate.get('economics', {})
             entry_cost = economics.get('entry_cost', 0.0)
-            max_loss = economics.get('max_loss', 0.0)  # <--- EXTRACTED HERE
+
+            # [FIXED: Removed artifact line here]
+            max_loss = economics.get('max_loss', 0.0)
 
             # Display Metadata
             legs = candidate.get('legs', [])
@@ -146,7 +179,7 @@ def main():
             )
 
             # --- C. BUILD TRADE DECISION ---
-            # FIX: Pass max_loss explicitely for "Binary Gamble" check
+            # Pass max_loss explicitly for "Binary Gamble" check
             decision_result = decision_builder.evaluate(mc_result, max_loss=max_loss)
 
             # --- D. PREPARE LEDGER ENTRY ---
