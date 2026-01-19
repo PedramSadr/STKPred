@@ -2,7 +2,7 @@ import os
 import sys
 import pandas as pd
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # --- 1. CONFIGURATION IMPORT ---
 try:
@@ -16,7 +16,7 @@ try:
     # 1. Candidate Generator
     from CandidateGenerator.candidate_generator import CandidateGenerator
 
-    # 2. Trade Decision Builder (Robust Import)
+    # 2. Trade Decision Builder
     try:
         from TradeDecisionBuilder.trade_decision_builder import TradeDecisionBuilder
     except ImportError:
@@ -25,7 +25,7 @@ try:
     # 3. Monte Carlo Engine
     from Montecarlo_Sharpe.MonteCarloEngine import MonteCarloEngine
 
-    # 4. Trade Manager (Lifecycle & Exits)
+    # 4. Trade Manager (Lifecycle & Persistence)
     try:
         from TradeManager.trade_manager import TradeManager
     except ImportError:
@@ -39,6 +39,10 @@ except ImportError as e:
 
 # --- 3. LOGGING SETUP ---
 def setup_logging():
+    # [FIX P1] Ensure logs directory exists BEFORE creating FileHandler
+    if hasattr(Config, 'LOGS_DIR'):
+        os.makedirs(Config.LOGS_DIR, exist_ok=True)
+
     log_filename = os.path.join(Config.LOGS_DIR, "daily_pipeline.log")
 
     logging.basicConfig(
@@ -63,7 +67,7 @@ def main():
     CATALOG_FILE = os.path.join(Config.DATA_DIR, f"{symbol}_Options_Contracts.csv")
     DAILY_FILE = os.path.join(Config.DATA_DIR, f"{symbol.lower()}_daily.csv")
 
-    # Output File
+    # Output File (Audit Ledger)
     LEDGER_FILE = Config.DB_FILE
 
     # Validate Inputs
@@ -99,27 +103,41 @@ def main():
         logging.error(f"CRITICAL DATA FAILURE: {e}")
         sys.exit(1)
 
-    # --- 5.5 EXIT MANAGEMENT (LIFECYCLE CHECK) ---
-    # This step delegates exit decisions to the TradeManager.
+    # --- 5.5 EXIT MANAGEMENT (REAL PORTFOLIO CHECK) ---
     if TradeManager:
-        logging.info("--- CHECKING EXITS (SIMULATION) ---")
+        logging.info("--- CHECKING OPEN POSITIONS ---")
         trade_manager = TradeManager()
 
-        # TODO: In Phase 2, load real 'open_positions.csv' here.
-        # For now, we simulate checking a mock trade to validate the architecture.
-        # Example: A trade expiring in 18 days (Should trigger TIME_STOP if rule is 21)
-        mock_trade_expiry = (pd.Timestamp(trade_date) + timedelta(days=18)).strftime('%Y-%m-%d')
-        mock_trade = {
-            'contractID': 'MOCK_TEST_SPREAD',
-            'expiration': mock_trade_expiry
-        }
+        # 1. Load Real Positions
+        open_positions = trade_manager.load_open_positions()
+        logging.info(f"Found {len(open_positions)} open positions.")
 
-        exit_decision = trade_manager.check_exit(mock_trade, trade_date)
+        for pos in open_positions:
+            # 2. Check Logic
+            exit_decision = trade_manager.check_exit(pos, trade_date)
 
-        if exit_decision['action'] == 'EXIT':
-            logging.info(f"[EXIT SIGNAL] {mock_trade['contractID']} -> {exit_decision['reason']}")
-        else:
-            logging.info(f"[HOLD] {mock_trade['contractID']} -> {exit_decision['reason']}")
+            # Explicit Error Handling
+            if exit_decision['action'] == 'ERROR':
+                logging.error(f"Error checking exit for {pos.get('contractID')}: {exit_decision['reason']}")
+                continue
+
+            if exit_decision['action'] == 'EXIT':
+                logging.info(f"[EXIT EXECUTION] {pos['contractID']} -> {exit_decision['reason']}")
+
+                # [FIX P1] Robust ID Extraction (Handle NaN/Missing Position IDs)
+                pid = pos.get('position_id')
+                # If pid is None, empty, or string "nan" (pandas artifact), fallback to contractID
+                if not pid or str(pid).lower() == 'nan':
+                    pid = pos.get('contractID')
+
+                # 3. Update Persistence (Close the trade)
+                trade_manager.close_position(
+                    position_id=pid,
+                    exit_reason=exit_decision['reason'],
+                    exit_date=trade_date
+                )
+            else:
+                logging.info(f"[HOLD] {pos.get('contractID')} (DTE: {exit_decision.get('reason')})")
     else:
         logging.info("--- SKIPPING EXITS (Manager Not Found) ---")
 
@@ -151,8 +169,6 @@ def main():
 
             economics = candidate.get('economics', {})
             entry_cost = economics.get('entry_cost', 0.0)
-
-            # [FIXED: Removed artifact line here]
             max_loss = economics.get('max_loss', 0.0)
 
             # Display Metadata
@@ -179,10 +195,9 @@ def main():
             )
 
             # --- C. BUILD TRADE DECISION ---
-            # Pass max_loss explicitly for "Binary Gamble" check
             decision_result = decision_builder.evaluate(mc_result, max_loss=max_loss)
 
-            # --- D. PREPARE LEDGER ENTRY ---
+            # --- D. PREPARE LEDGER ENTRY (AUDIT) ---
             entry = {
                 'timestamp': datetime.now().isoformat(),
                 'trade_date': trade_date,
@@ -206,11 +221,33 @@ def main():
             ledger_entries.append(entry)
             logging.info(f"-> Decision: {entry['decision']} | Reason: {entry['reason']}")
 
+            # --- E. EXECUTION (PHASE 2 - PERSISTENCE) ---
+            # If decision is TRADE, we now "Book It" to our Portfolio
+            if decision_result.get('decision') == 'TRADE':
+                logging.info(f"*** NEW TRADE EXECUTED: {contract_id} ***")
+
+                # Create a streamlined record for open_positions.csv
+                position_record = {
+                    'entry_date': trade_date,
+                    'contractID': contract_id,
+                    'symbol': symbol,
+                    'strategy': structure_type,
+                    'expiration': expiration,
+                    'strike': strike_display,
+                    'entry_cost': entry_cost,
+                    'max_loss': max_loss,
+                    'qty': 1,  # Default to 1 lot for paper trading
+                }
+
+                # Persist to open_positions.csv
+                if TradeManager:
+                    trade_manager.save_new_position(position_record)
+
         except Exception as e:
             logging.error(f"Error processing candidate {i}: {e}", exc_info=True)
             continue
 
-    # --- 9. SAVE TO LEDGER ---
+    # --- 9. SAVE TO LEDGER (AUDIT TRAIL) ---
     if ledger_entries:
         df_new = pd.DataFrame(ledger_entries)
 
