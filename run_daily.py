@@ -2,6 +2,7 @@ import os
 import sys
 import pandas as pd
 import logging
+import json
 from datetime import datetime
 
 # --- 1. CONFIGURATION IMPORT ---
@@ -13,32 +14,24 @@ except ImportError:
 
 # --- 2. MODULE IMPORTS ---
 try:
-    # 1. Candidate Generator
     from CandidateGenerator.candidate_generator import CandidateGenerator
 
-    # 2. Trade Decision Builder
     try:
         from TradeDecisionBuilder.trade_decision_builder import TradeDecisionBuilder
     except ImportError:
         from TradeDecisionBuilder.TradeDecisionBuilder import TradeDecisionBuilder
+    from Montecarlo_Sharpe.monte_carlo_engine import MonteCarloEngine
 
-    # 3. Monte Carlo Engine
-    from Montecarlo_Sharpe.MonteCarloEngine import MonteCarloEngine
-
-    # 4. Trade Manager (Lifecycle & Persistence)
     try:
         from TradeManager.trade_manager import TradeManager
     except ImportError:
         logging.warning("TradeManager not found. Exit logic will be skipped.")
         TradeManager = None
-
-    # [NEW] 5. Portfolio Risk Manager (Phase 3 Allocation)
     try:
         from TradeDecisionBuilder.portfolio_risk_manager import PortfolioRiskManager
     except ImportError:
-        logging.warning("PortfolioRiskManager not found. Sizing will be default (1 lot).")
+        logging.error("PortfolioRiskManager not found. Trading will be BLOCKED (Fail Closed).")
         PortfolioRiskManager = None
-
 except ImportError as e:
     print(f"CRITICAL IMPORT ERROR: {e}")
     sys.exit(1)
@@ -48,25 +41,45 @@ except ImportError as e:
 def setup_logging():
     if hasattr(Config, 'LOGS_DIR'):
         os.makedirs(Config.LOGS_DIR, exist_ok=True)
-
     log_filename = os.path.join(Config.LOGS_DIR, "daily_pipeline.log")
-
     logging.basicConfig(
         level=logging.DEBUG if Config.DEBUG_MODE else logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(log_filename, mode='a'),
-            logging.StreamHandler(sys.stdout)
-        ]
+        handlers=[logging.FileHandler(log_filename, mode='a'), logging.StreamHandler(sys.stdout)]
     )
     logging.info(f"--- STARTING DAILY RUN (ENV: {Config.APP_ENV}) ---")
     logging.info(f"Target Ticker: {Config.UNDERLYING_SYMBOL}")
 
 
+def calculate_intrinsic_value(legs_json, current_spot):
+    """Calculates intrinsic value of a spread at expiration."""
+    try:
+        legs = json.loads(legs_json)
+        value = 0.0
+        for leg in legs:
+            strike = float(leg['strike'])
+
+            # [FIX] Robust Normalization
+            l_type = leg.get('type', 'put').lower()
+            l_side = leg.get('side', 'long').lower()
+
+            side_multiplier = 1 if l_side == 'long' else -1
+
+            if l_type == 'put':
+                leg_val = max(0.0, strike - current_spot)
+            else:
+                leg_val = max(0.0, current_spot - strike)
+
+            value += (leg_val * side_multiplier)
+        return max(0.0, value)
+    except Exception:
+        return 0.0
+
+
 def main():
     setup_logging()
 
-    # --- 4. PATH SETUP (DYNAMIC) ---
+    # --- 4. PATH SETUP ---
     symbol = Config.UNDERLYING_SYMBOL
     CATALOG_FILE = os.path.join(Config.DATA_DIR, f"{symbol}_Options_Contracts.csv")
     DAILY_FILE = os.path.join(Config.DATA_DIR, f"{symbol.lower()}_daily.csv")
@@ -90,7 +103,6 @@ def main():
 
         current_price = df_daily['close'].iloc[-1]
         trade_date = df_daily['date'].iloc[-1] if 'date' in df_daily.columns else datetime.now().strftime('%Y-%m-%d')
-
         logging.info(f"Market Context: Date={trade_date}, S0=${current_price:.2f}")
 
     except Exception as e:
@@ -100,105 +112,108 @@ def main():
     # --- 6. INITIALIZE MANAGERS ---
     trade_manager = None
     risk_manager = None
-
     if TradeManager:
         trade_manager = TradeManager()
-
-        # Initialize Risk Manager with path to open_positions.csv
         if PortfolioRiskManager:
             risk_manager = PortfolioRiskManager(Config, trade_manager.positions_file)
             logging.info("Portfolio Risk Manager: ACTIVE")
 
-        # --- CHECK EXITS ---
+    # --- 7. INITIALIZE GENERATOR ---
+    logging.info("Initializing Option Data...")
+    generator = CandidateGenerator(CATALOG_FILE, current_price, trade_date)
+
+    # --- 8. EXIT MANAGEMENT ---
+    if trade_manager:
         logging.info("--- CHECKING OPEN POSITIONS ---")
         open_positions = trade_manager.load_open_positions()
-        logging.info(f"Found {len(open_positions)} open positions.")
 
         for pos in open_positions:
-            exit_decision = trade_manager.check_exit(pos, trade_date)
+            decision = trade_manager.check_exit(pos, trade_date)
 
-            if exit_decision['action'] == 'ERROR':
-                logging.error(f"Error checking exit for {pos.get('contractID')}: {exit_decision['reason']}")
-                continue
+            if decision['action'] == 'EXIT':
+                # 1. Try Market Bid
+                legs_list = json.loads(pos.get('legs_json', '[]'))
+                exit_price = generator.get_composite_price(legs_list, price_type='bid')
 
-            if exit_decision['action'] == 'EXIT':
-                logging.info(f"[EXIT EXECUTION] {pos.get('contractID')} -> {exit_decision['reason']}")
-                pid = pos.get('position_id')
-                if not pid or str(pid).lower() == 'nan': pid = pos.get('contractID')
+                # 2. Handle Missing / Expiration
+                if exit_price <= 0.0:
+                    if decision['reason'] == 'EXPIRATION':
+                        exit_price = calculate_intrinsic_value(pos.get('legs_json', '[]'), current_price)
+                        logging.info(f"Expiration Settlement: Intrinsic Value = ${exit_price:.2f}")
+                    else:
+                        logging.warning(f"Skipping Close for {pos['contractID']}: No Bid Found.")
+                        continue
 
+                logging.info(f"[EXIT EXECUTION] {pos.get('contractID')} -> {decision['reason']} @ ${exit_price:.2f}")
                 trade_manager.close_position(
-                    position_id=pid,
-                    exit_reason=exit_decision['reason'],
-                    exit_date=trade_date
+                    position_id=pos.get('position_id'),
+                    exit_reason=decision['reason'],
+                    exit_date=trade_date,
+                    exit_price=exit_price
                 )
-            else:
-                logging.info(f"[HOLD] {pos.get('contractID')} (DTE: {exit_decision.get('reason')})")
 
-    # --- 7. GENERATE CANDIDATES ---
+    # --- 9. GENERATE CANDIDATES ---
     logging.info("--- GENERATING NEW ENTRIES ---")
-    generator = CandidateGenerator(
-        catalog_path=CATALOG_FILE,
-        current_price=current_price,
-        trade_date=trade_date
-    )
     candidates = generator.generate_candidates()
     logging.info(f"Generated {len(candidates)} candidates.")
 
-    # --- 8. INITIALIZE ENGINES ---
+    # --- 10. INITIALIZE ENGINES ---
     mc_engine = MonteCarloEngine()
     decision_builder = TradeDecisionBuilder()
     ledger_entries = []
 
-    # --- 9. MAIN ANALYSIS LOOP ---
+    # --- 11. MAIN ANALYSIS LOOP ---
     for i, candidate in enumerate(candidates):
         try:
             contract_id = candidate.get('contractID', 'UNKNOWN')
             structure_type = candidate.get('strategy', 'UNKNOWN')
             economics = candidate.get('economics', {})
-            entry_cost = economics.get('entry_cost', 0.0)
-            max_loss = economics.get('max_loss', 0.0)
 
-            # Metadata
+            # [REALISM] Entry Price (Ask)
+            entry_price = economics.get('ask', 0.0)
+            if entry_price <= 0:
+                logging.warning(f"Generator failed to price {contract_id}. Using Mid+0.05.")
+                entry_price = economics.get('entry_cost', 0.0) + 0.05
+
+            max_loss = economics.get('max_loss', 0.0)
             legs = candidate.get('legs', [])
             expiration = legs[0]['expiration'] if legs else "N/A"
-            strike_display = f"{legs[0]['strike']}/{legs[1]['strike']}" if len(legs) == 2 else "N/A"
 
-            logging.info(f"Analyzing {contract_id} (Cost: ${entry_cost:.2f})...")
+            logging.info(f"Analyzing {contract_id} (Est. Entry: ${entry_price:.2f})...")
 
-            # A. Monte Carlo Simulation
-            mc_result = mc_engine.analyze(candidate, current_price, entry_cost, trade_date=trade_date)
-
-            # Inject CVaR back into candidate for Risk Manager
+            # A. Monte Carlo
+            mc_result = mc_engine.analyze(candidate, current_price, entry_price, trade_date=trade_date)
             candidate['CVaR95'] = mc_result.get('CVaR95', 0.0)
 
-            # B. Trade Decision (Edge Check)
+            # B. Decision
             decision_result = decision_builder.evaluate(mc_result, max_loss=max_loss)
-
             decision = decision_result.get('decision', 'ERROR')
             reason = decision_result.get('reason', 'Unknown')
 
             qty = 0
             risk_details = {}
 
-            # C. Allocation (Size Check) - ONLY if Edge is Good
-            if decision == 'TRADE' and risk_manager:
-                # Pass Account Equity (Static $10k for paper trading, or dynamic from config)
-                equity = getattr(Config, 'ACCOUNT_EQUITY', 10000.0)
-                qty, risk_details = risk_manager.allocate(candidate, equity=equity)
-
-                if qty == 0:
+            # C. Allocation [FAIL CLOSED]
+            if decision == 'TRADE':
+                if risk_manager:
+                    equity = getattr(Config, 'ACCOUNT_EQUITY', 10000.0)
+                    qty, risk_details = risk_manager.allocate(candidate, equity=equity)
+                    if qty == 0:
+                        decision = 'SKIP'
+                        reason = f"Risk Blocked: {risk_details.get('blocked_by')}"
+                else:
+                    # [SAFETY FIX] Fail Closed if Risk Manager is missing
                     decision = 'SKIP'
-                    reason = f"Risk Blocked: {risk_details.get('blocked_by')} ({risk_details.get('reason', '')})"
-            elif decision == 'TRADE' and not risk_manager:
-                qty = 1  # Fallback if Risk Manager missing
+                    reason = "Risk Manager Missing - Trading Blocked"
+                    qty = 0
 
-            # D. Ledger Entry
+            # D. Ledger
             entry = {
                 'timestamp': datetime.now().isoformat(),
                 'trade_date': trade_date,
                 'contractID': contract_id,
                 'type': structure_type,
-                'entry_price': entry_cost,
+                'entry_price': entry_price,
                 'max_loss': max_loss,
                 'decision': decision,
                 'reason': reason,
@@ -209,28 +224,32 @@ def main():
             ledger_entries.append(entry)
             logging.info(f"-> Decision: {decision} | Qty: {qty} | Reason: {reason}")
 
-            # E. Execution (Persistence)
+            # E. Execution
             if decision == 'TRADE' and qty > 0 and trade_manager:
                 logging.info(f"*** EXECUTION: Buying {qty}x {contract_id} ***")
 
-                # [CRITICAL] Prepare Record with EXACT UNITS for Risk Manager
-                # 1. Calculate Per-Contract Risk (x100)
                 max_loss_per_contract = max_loss * 100
                 cvar_per_contract = abs(candidate.get('CVaR95', 0.0)) * 100
+
+                cand_symbol = candidate.get('symbol', symbol)
+                factor_map = {'TSLA': 'QQQ', 'NVDA': 'QQQ', 'AMD': 'QQQ', 'SPY': 'SPY'}
+                factor = factor_map.get(cand_symbol, 'Unmapped')
+
+                legs_json = json.dumps(legs)
 
                 position_record = {
                     'entry_date': trade_date,
                     'contractID': contract_id,
-                    'symbol': symbol,
+                    'symbol': cand_symbol,
                     'strategy': structure_type,
+                    'factor': factor,
                     'expiration': expiration,
+                    'legs_json': legs_json,
                     'qty': qty,
-
-                    # Store Metrics for Risk Manager Layer 2 & 3
+                    'entry_price': entry_price,
+                    'fees': 1.0 * qty,
                     'max_loss_per_contract': round(max_loss_per_contract, 2),
                     'cvar_per_contract': round(cvar_per_contract, 2),
-                    'entry_cost': entry_cost,
-
                     'status': 'OPEN'
                 }
 
@@ -240,7 +259,7 @@ def main():
             logging.error(f"Error processing candidate {i}: {e}", exc_info=True)
             continue
 
-    # --- 10. SAVE LEDGER ---
+    # --- 12. SAVE LEDGER ---
     if ledger_entries:
         df_new = pd.DataFrame(ledger_entries)
         if os.path.exists(LEDGER_FILE):
@@ -251,7 +270,6 @@ def main():
                 df_final = df_new
         else:
             df_final = df_new
-
         df_final.to_csv(LEDGER_FILE, index=False)
         logging.info(f"[LEDGER] Saved {len(df_new)} rows to {LEDGER_FILE}")
 

@@ -1,195 +1,123 @@
 import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
-from typing import List, Dict, Optional
 import logging
-from config import Config
-
-
-# --- CONFIGURATION CLASS ---
-class GeneratorConfig:
-    def __init__(self):
-        self.MIN_DTE = 7
-        self.MAX_DTE = 45
-        self.MIN_DELTA = 0.20
-        self.MAX_DELTA = 0.50
-        self.MIN_LIQUIDITY = 100
-        self.MAX_SPREAD_PCT = 0.05
-        self.SPREAD_WIDTHS = [5, 10]
 
 
 class CandidateGenerator:
     """
-    Generates trade candidates with deterministic IDs and complete economics.
-    Now includes robust column loading to prevent crashes on missing data.
+    Generates trading candidates and handles Real-Time Pricing.
+    Phase 4: Functional Candidate Loop + Composite Pricing.
     """
 
-    def __init__(self, catalog_path: str, current_price: float, trade_date=None, config: GeneratorConfig = None):
+    def __init__(self, catalog_path, current_price, trade_date=None):
         self.catalog_path = catalog_path
         self.current_price = current_price
-        self.config = config if config else GeneratorConfig()
+        self.trade_date = trade_date
+        self.df_chain = pd.DataFrame()
+        self._load_data()
 
-        # Time Consistency
-        if trade_date:
-            self.trade_date = pd.Timestamp(trade_date)
-        else:
-            self.trade_date = pd.Timestamp.now()
-
-        # Strategy Gates
-        self.enable_spreads = Config.ENABLE_SPREADS
-        self.enable_single_legs = Config.ENABLE_SINGLE_LEGS
-
-        self.catalog = None
-        self._load_catalog()
-
-    def _load_catalog(self):
+    def _load_data(self):
         try:
-            self.catalog = pd.read_csv(self.catalog_path)
+            self.df_chain = pd.read_csv(self.catalog_path)
+            self.df_chain.columns = [c.lower().strip() for c in self.df_chain.columns]
 
-            # --- FIX: ROBUST COLUMN NORMALIZATION ---
-            # 1. Strip whitespace from headers
-            self.catalog.columns = [c.strip() for c in self.catalog.columns]
+            if 'option_symbol' in self.df_chain.columns and 'symbol' not in self.df_chain.columns:
+                self.df_chain.rename(columns={'option_symbol': 'symbol'}, inplace=True)
 
-            # 2. Normalize common column names (Handle OpenInterest vs open_interest vs openInterest)
-            # Map of {Target Name: [Possible Aliases]}
-            alias_map = {
-                'openInterest': ['open_interest', 'OpenInterest', 'openinterest', 'OPEN_INTEREST', 'oi', 'OI'],
-                'volume': ['Volume', 'vol', 'VOL'],
-                'ask': ['Ask', 'ASK', 'ask_price'],
-                'bid': ['Bid', 'BID', 'bid_price'],
-                'strike': ['Strike', 'STRIKE', 'strike_price']
-            }
-
-            for target, aliases in alias_map.items():
-                if target not in self.catalog.columns:
-                    for alias in aliases:
-                        if alias in self.catalog.columns:
-                            self.catalog.rename(columns={alias: target}, inplace=True)
-                            logging.debug(f"Renamed column '{alias}' to '{target}'")
-                            break
-
-            # 3. Fill missing columns with 0 instead of crashing
-            for col in ['openInterest', 'volume', 'ask', 'bid', 'strike']:
-                if col not in self.catalog.columns:
-                    logging.warning(f"Column '{col}' missing. Filling with 0 to prevent crash.")
-                    self.catalog[col] = 0
-
-            # 4. Normalization & Dedup
-            if 'type' in self.catalog.columns:
-                self.catalog['type'] = self.catalog['type'].str.upper().str.strip()
-
-            if 'contractID' in self.catalog.columns:
-                self.catalog = self.catalog.drop_duplicates(subset=['contractID'])
-            else:
-                self.catalog = self.catalog.drop_duplicates(subset=['expiration', 'strike', 'type'])
-
-            # 5. Type Conversions
-            self.catalog['expiration'] = pd.to_datetime(self.catalog['expiration'])
-            cols = ['strike', 'ask', 'bid', 'openInterest', 'volume']
-            for c in cols:
-                self.catalog[c] = pd.to_numeric(self.catalog[c], errors='coerce')
-
-            # 6. Quality Filters
-            self.catalog = self.catalog[
-                (self.catalog['bid'] > 0) &
-                (self.catalog['ask'] > 0) &
-                (self.catalog['ask'] > self.catalog['bid'])
-                ].copy()
-
-            self.catalog['mid'] = (self.catalog['ask'] + self.catalog['bid']) / 2
-            self.catalog['spread_pct'] = (self.catalog['ask'] - self.catalog['bid']) / self.catalog['mid']
-
-            # 7. Liquidity Gates
-            self.catalog = self.catalog[self.catalog['spread_pct'] <= self.config.MAX_SPREAD_PCT]
-            self.catalog['openInterest'] = self.catalog['openInterest'].fillna(0)
-            self.catalog['volume'] = self.catalog['volume'].fillna(0)
-
-            self.catalog = self.catalog[
-                (self.catalog['openInterest'] >= self.config.MIN_LIQUIDITY) |
-                (self.catalog['volume'] >= self.config.MIN_LIQUIDITY)
-                ]
-
-            logging.info(f"[CandidateGenerator] Loaded {len(self.catalog)} valid contracts.")
+            if 'type' in self.df_chain.columns:
+                self.df_chain['type'] = self.df_chain['type'].str.lower()
 
         except Exception as e:
-            logging.error(f"[CandidateGenerator] Failed to load catalog: {e}")
-            self.catalog = pd.DataFrame()
+            logging.error(f"Failed to load catalog {self.catalog_path}: {e}")
 
-    def generate_candidates(self) -> List[Dict]:
+    def get_composite_price(self, legs_list, price_type='bid'):
+        """
+        Calculates spread price from legs.
+        Entry (Ask): Long Ask - Short Bid
+        Exit  (Bid): Long Bid - Short Ask
+        """
+        if self.df_chain.empty or not legs_list: return 0.0
+
+        total_price = 0.0
+        try:
+            for leg in legs_list:
+                mask = (
+                        (self.df_chain['expiration'] == leg['expiration']) &
+                        (self.df_chain['strike'] == float(leg['strike'])) &
+                        (self.df_chain['type'] == leg['type'].lower())
+                )
+                row = self.df_chain[mask]
+                if row.empty: return 0.0
+
+                side = leg.get('side', 'long')
+
+                if price_type == 'ask':  # Entry (Debit)
+                    if side == 'long':
+                        p = float(row['ask'].iloc[0])
+                    else:
+                        p = -float(row['bid'].iloc[0])
+                elif price_type == 'bid':  # Exit (Credit)
+                    if side == 'long':
+                        p = float(row['bid'].iloc[0])
+                    else:
+                        p = -float(row['ask'].iloc[0])
+
+                total_price += p
+            return total_price
+
+        except Exception as e:
+            logging.error(f"Pricing Error: {e}")
+            return 0.0
+
+    def generate_candidates(self):
+        """
+        Generates Put Debit Spreads (Long ITM / Short OTM).
+        """
         candidates = []
-        if self.catalog.empty: return candidates
+        if self.df_chain.empty: return []
 
-        self.catalog['dte'] = (self.catalog['expiration'] - self.trade_date).dt.days
-        subset = self.catalog[
-            (self.catalog['dte'] >= self.config.MIN_DTE) &
-            (self.catalog['dte'] <= self.config.MAX_DTE)
-            ].copy()
+        puts = self.df_chain[self.df_chain['type'] == 'put'].copy()
+        if puts.empty: return []
 
-        # Generate Puts
-        puts = subset[subset['type'] == 'PUT']
-        puts = puts[
-            (puts['strike'] >= self.current_price * 0.85) &
-            (puts['strike'] <= self.current_price * 1.10)
-            ]
+        expirations = puts['expiration'].unique()
 
-        for _, row in puts.iterrows():
-            # 1. Single Legs (Gated)
-            if self.enable_single_legs:
-                max_gain = row['strike'] - row['ask']
+        for exp in expirations:
+            chain_exp = puts[puts['expiration'] == exp]
 
-                candidates.append({
-                    'strategy': 'SINGLE_PUT',
-                    'contractID': row['contractID'],
-                    'legs': [row.to_dict()],
-                    'economics': {
-                        'entry_cost': row['ask'],
-                        'max_loss': row['ask'],
-                        'max_gain': max_gain,
-                        'breakeven': row['strike'] - row['ask']
+            long_cands = chain_exp[chain_exp['strike'] > self.current_price]
+            short_cands = chain_exp[chain_exp['strike'] < self.current_price]
+
+            for _, long_leg in long_cands.iterrows():
+                # Heuristic: Width ~ $5-$15
+                shorts = short_cands[
+                    (short_cands['strike'] < long_leg['strike']) &
+                    (short_cands['strike'] >= long_leg['strike'] - 15)
+                    ]
+
+                for _, short_leg in shorts.iterrows():
+                    legs = [
+                        {'side': 'long', 'strike': long_leg['strike'], 'type': 'put', 'expiration': exp},
+                        {'side': 'short', 'strike': short_leg['strike'], 'type': 'put', 'expiration': exp}
+                    ]
+
+                    spread_ask = self.get_composite_price(legs, 'ask')
+                    spread_bid = self.get_composite_price(legs, 'bid')
+
+                    if spread_ask <= 0: continue
+
+                    max_loss = spread_ask
+
+                    cand = {
+                        'contractID': f"SPREAD_PUT_{exp}_{long_leg['strike']}_{short_leg['strike']}",
+                        'symbol': 'TSLA',
+                        'strategy': 'PUT_DEBIT_SPREAD',
+                        'legs': legs,
+                        'economics': {
+                            'ask': spread_ask,
+                            'bid': spread_bid,
+                            'entry_cost': spread_ask,
+                            'max_loss': max_loss
+                        }
                     }
-                })
-
-            # 2. Spreads (Gated)
-            if self.enable_spreads:
-                self._generate_spreads_for_leg(row, puts, candidates)
+                    candidates.append(cand)
 
         return candidates
-
-    def _generate_spreads_for_leg(self, long_leg, all_puts, candidates_list):
-        for width in self.config.SPREAD_WIDTHS:
-            target_short_strike = long_leg['strike'] - width
-
-            matches = all_puts[
-                (all_puts['expiration'] == long_leg['expiration']) &
-                (np.isclose(all_puts['strike'], target_short_strike, atol=0.5))
-                ].copy()
-
-            if not matches.empty:
-                matches = matches.sort_values(by=['openInterest', 'volume'], ascending=[False, False])
-                short_leg = matches.iloc[0]
-
-                # Economics
-                net_debit = long_leg['ask'] - short_leg['bid']
-                if net_debit <= 0.01: continue
-
-                max_loss = net_debit
-                max_gain = width - net_debit
-                breakeven = long_leg['strike'] - net_debit
-
-                # Canonical ID with Expiration Date
-                exp_str = long_leg['expiration'].strftime('%Y%m%d')
-                composite_id = f"SPREAD_{exp_str}_{long_leg['strike']}_{short_leg['strike']}_PUT_DEBIT"
-
-                spread_candidate = {
-                    'strategy': 'VERTICAL_PUT_DEBIT',
-                    'contractID': composite_id,
-                    'legs': [long_leg.to_dict(), short_leg.to_dict()],
-                    'economics': {
-                        'entry_cost': round(net_debit, 2),
-                        'max_loss': round(max_loss, 2),
-                        'max_gain': round(max_gain, 2),
-                        'breakeven': round(breakeven, 2),
-                        'width': width
-                    }
-                }
-                candidates_list.append(spread_candidate)

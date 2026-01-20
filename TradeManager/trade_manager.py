@@ -3,11 +3,11 @@ import os
 import uuid
 import logging
 from datetime import datetime
+from pathlib import Path
 
 try:
     from config import Config
 except ImportError:
-    # Fallback for testing/standalone use
     class Config:
         EXIT_RULE_DTE = 21
         LOGS_DIR = "logs"
@@ -15,109 +15,105 @@ except ImportError:
 
 class TradeManager:
     """
-    Lifecycle Manager: Handles Exit Logic AND Position Persistence.
-    Hardened for Production: Uses UUIDs and Safe File Operations.
+    Lifecycle Manager: Phase 4 Hardening.
     """
+    SCHEMA = [
+        "position_id", "status", "entry_date", "exit_date", "exit_reason",
+        "symbol", "strategy", "contractID", "factor",
+        "expiration", "legs_json",
+        "entry_price", "exit_price", "qty", "fees",
+        "max_loss_per_contract", "cvar_per_contract", "realized_pnl"
+    ]
 
     def __init__(self):
-        # 1. Load Rules
         self.time_stop_dte = getattr(Config, 'EXIT_RULE_DTE', 21)
-
-        # 2. Define Persistence Path
         self.positions_file = os.path.join(Config.LOGS_DIR, "open_positions.csv")
-
-        # [FIX P1] Ensure directory exists immediately to prevent IOErrors
         os.makedirs(os.path.dirname(self.positions_file), exist_ok=True)
 
-    # --- CORE LOGIC ---
+    def _load_df(self):
+        """Safe loader with Strict Schema Validation."""
+        if not Path(self.positions_file).exists():
+            return pd.DataFrame(columns=self.SCHEMA)
+
+        try:
+            df = pd.read_csv(self.positions_file)
+
+            # [FIX] Fail Closed on Schema Drift
+            missing = set(self.SCHEMA) - set(df.columns)
+            if missing:
+                logging.error(f"CRITICAL: Schema Mismatch in {self.positions_file}. Missing: {missing}")
+                return pd.DataFrame(columns=self.SCHEMA)
+
+            return df[self.SCHEMA]
+        except Exception as e:
+            logging.error(f"Corrupt Positions File: {e}")
+            return pd.DataFrame(columns=self.SCHEMA)
+
+    def _atomic_write(self, df):
+        temp = self.positions_file + ".tmp"
+        try:
+            df.to_csv(temp, index=False)
+            if os.path.exists(self.positions_file):
+                os.remove(self.positions_file)
+            os.rename(temp, self.positions_file)
+        except Exception as e:
+            logging.error(f"Atomic Write Failed: {e}")
+
+    def save_new_position(self, trade_dict):
+        df = self._load_df()
+
+        # Idempotency
+        if not df.empty and 'contractID' in df.columns:
+            if not df[(df['contractID'] == trade_dict['contractID']) & (df['status'] == 'OPEN')].empty:
+                logging.warning(f"IDEMPOTENCY: Skipping duplicate {trade_dict['contractID']}")
+                return False
+
+        trade_dict['position_id'] = str(uuid.uuid4())
+        defaults = {'status': 'OPEN', 'realized_pnl': 0.0, 'exit_price': 0.0, 'fees': 0.0}
+        for k, v in defaults.items():
+            if k not in trade_dict: trade_dict[k] = v
+
+        new_row = pd.DataFrame([trade_dict]).reindex(columns=self.SCHEMA)
+        df = pd.concat([df, new_row], ignore_index=True)
+        self._atomic_write(df)
+        logging.info(f"Persisted {trade_dict['contractID']}")
+        return True
+
+    def close_position(self, position_id, exit_reason, exit_date, exit_price, fees=0.0):
+        df = self._load_df()
+        if df.empty: return
+
+        mask = df['position_id'] == position_id
+        if not mask.any(): mask = df['contractID'] == position_id
+
+        if mask.any():
+            entry_price = pd.to_numeric(df.loc[mask, 'entry_price']).iloc[0]
+            qty = pd.to_numeric(df.loc[mask, 'qty']).iloc[0]
+
+            # Spread PnL (Sell to Close)
+            gross = (exit_price - entry_price) * qty * 100
+            net = gross - fees
+
+            df.loc[mask, 'status'] = 'CLOSED'
+            df.loc[mask, 'exit_reason'] = exit_reason
+            df.loc[mask, 'exit_date'] = exit_date
+            df.loc[mask, 'exit_price'] = exit_price
+            df.loc[mask, 'realized_pnl'] = round(net, 2)
+
+            self._atomic_write(df)
+            logging.info(f"Closed {position_id} @ ${exit_price:.2f} (PnL ${net:.2f})")
+
+    def load_open_positions(self):
+        df = self._load_df()
+        return df[df['status'] == 'OPEN'].to_dict('records') if not df.empty else []
+
     def check_exit(self, trade_record, current_date):
-        """
-        Evaluates an open trade against exit rules.
-        Returns: {'action': 'EXIT'|'HOLD'|'ERROR', 'reason': str}
-        """
         try:
             expiration = pd.to_datetime(trade_record['expiration'])
             curr_date = pd.to_datetime(current_date)
-        except Exception as e:
-            return {'action': 'ERROR', 'reason': f"Date Parse Error: {e}"}
-
-        dte = (expiration - curr_date).days
-
-        # [FIX] RULE 1: EXPIRATION (Check this FIRST)
-        if dte <= 0:
-            return {'action': 'EXIT', 'reason': "EXPIRATION"}
-
-        # [FIX] RULE 2: TIME STOP (Check this SECOND)
-        if dte <= self.time_stop_dte:
-            return {
-                'action': 'EXIT',
-                'reason': f"TIME_STOP_HIT (DTE {dte} <= {self.time_stop_dte})"
-            }
-
-        return {'action': 'HOLD', 'reason': f"DTE {dte} > {self.time_stop_dte}"}
-
-    # --- PERSISTENCE METHODS ---
-    def load_open_positions(self):
-        """Reads the portfolio file and returns active trades."""
-        if not os.path.exists(self.positions_file):
-            return []
-        try:
-            df = pd.read_csv(self.positions_file)
-
-            # [FIX] Warn if file exists but is malformed
-            if 'status' not in df.columns:
-                logging.warning(f"Positions file found but missing 'status' column: {self.positions_file}")
-                return []
-
-            return df[df['status'] == 'OPEN'].to_dict('records')
-        except Exception as e:
-            logging.error(f"Failed to load positions: {e}")
-            return []
-
-    def save_new_position(self, trade_dict):
-        """Appends a new accepted trade to the positions file with a UUID."""
-        # [FIX P1] Add Unique ID to prevent 'double counting' issues
-        trade_dict['position_id'] = str(uuid.uuid4())
-
-        # Enforce defaults
-        trade_dict['status'] = 'OPEN'
-        trade_dict['exit_date'] = None
-        trade_dict['exit_reason'] = None
-        trade_dict['realized_pnl'] = 0.0  # Placeholder for Phase 3
-
-        df_new = pd.DataFrame([trade_dict])
-
-        # Append to CSV (create header if file doesn't exist)
-        if os.path.exists(self.positions_file):
-            df_new.to_csv(self.positions_file, mode='a', header=False, index=False)
-        else:
-            df_new.to_csv(self.positions_file, mode='w', header=True, index=False)
-
-        logging.info(f"Persisted new position {trade_dict['position_id']} ({trade_dict['contractID']})")
-
-    def close_position(self, position_id, exit_reason, exit_date):
-        """Updates an existing position to CLOSED status using Unique ID."""
-        if not os.path.exists(self.positions_file): return
-
-        try:
-            df = pd.read_csv(self.positions_file)
-
-            # [FIX P1] Match by Unique position_id, not just contractID
-            if 'position_id' in df.columns:
-                mask = df['position_id'] == position_id
-            else:
-                # Fallback for legacy files created before this update
-                mask = df['contractID'] == position_id
-
-            if mask.any():
-                df.loc[mask, 'status'] = 'CLOSED'
-                df.loc[mask, 'exit_reason'] = exit_reason
-                df.loc[mask, 'exit_date'] = exit_date
-
-                df.to_csv(self.positions_file, index=False)
-                logging.info(f"Closed position {position_id}")
-            else:
-                logging.error(f"Could not find position_id {position_id} to close.")
-
-        except Exception as e:
-            logging.error(f"Failed to close position {position_id}: {e}")
+            dte = (expiration - curr_date).days
+            if dte <= 0: return {'action': 'EXIT', 'reason': "EXPIRATION"}
+            if dte <= self.time_stop_dte: return {'action': 'EXIT', 'reason': f"TIME_STOP_HIT"}
+            return {'action': 'HOLD', 'reason': f"DTE {dte}"}
+        except:
+            return {'action': 'ERROR', 'reason': 'Date Parse'}
