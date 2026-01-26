@@ -20,7 +20,7 @@ try:
         from TradeDecisionBuilder.trade_decision_builder import TradeDecisionBuilder
     except ImportError:
         from TradeDecisionBuilder.TradeDecisionBuilder import TradeDecisionBuilder
-    from Montecarlo_Sharpe.monte_carlo_engine import MonteCarloEngine
+    from Montecarlo_Sharpe.MonteCarloEngine import MonteCarloEngine
 
     try:
         from TradeManager.trade_manager import TradeManager
