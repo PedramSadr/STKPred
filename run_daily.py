@@ -3,7 +3,7 @@ import sys
 import pandas as pd
 import logging
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # --- 1. CONFIGURATION IMPORT ---
 try:
@@ -58,11 +58,8 @@ def calculate_intrinsic_value(legs_json, current_spot):
         value = 0.0
         for leg in legs:
             strike = float(leg['strike'])
-
-            # [FIX] Robust Normalization
             l_type = leg.get('type', 'put').lower()
             l_side = leg.get('side', 'long').lower()
-
             side_multiplier = 1 if l_side == 'long' else -1
 
             if l_type == 'put':
@@ -92,7 +89,7 @@ def main():
         logging.error(f"Daily data not found: {DAILY_FILE}")
         sys.exit(1)
 
-    # --- 5. LOAD MARKET CONTEXT ---
+    # --- 5. LOAD MARKET CONTEXT & KILL SWITCH ---
     logging.info("Loading market data...")
     try:
         df_daily = pd.read_csv(DAILY_FILE)
@@ -101,8 +98,27 @@ def main():
         col_map.update({c: 'date' for c in df_daily.columns if 'date' in c or 'timestamp' in c})
         if col_map: df_daily.rename(columns=col_map, inplace=True)
 
+        # [CRITICAL FIX] Ensure data is sorted by date (Fixes VWAP/SMA bugs)
+        if 'date' in df_daily.columns:
+            df_daily['date'] = pd.to_datetime(df_daily['date'])
+            df_daily.sort_values('date', inplace=True)
+
         current_price = df_daily['close'].iloc[-1]
-        trade_date = df_daily['date'].iloc[-1] if 'date' in df_daily.columns else datetime.now().strftime('%Y-%m-%d')
+        trade_date_dt = df_daily['date'].iloc[-1]
+        trade_date = trade_date_dt.strftime('%Y-%m-%d')
+
+        # [NEW] Data Freshness Kill-Switch
+        today = datetime.now()
+        days_lag = (today - trade_date_dt).days
+        if days_lag > 4:  # Allow for weekends/holidays
+            msg = f"CRITICAL: Market data is stale! Last date: {trade_date}. Lag: {days_lag} days."
+            logging.error(msg)
+            if Config.APP_ENV == 'PROD':
+                logging.error("ABORTING RUN (PROD SAFETY).")
+                sys.exit(1)
+            else:
+                logging.warning("Proceeding in DEV mode with stale data...")
+
         logging.info(f"Market Context: Date={trade_date}, S0=${current_price:.2f}")
 
     except Exception as e:
@@ -131,11 +147,9 @@ def main():
             decision = trade_manager.check_exit(pos, trade_date)
 
             if decision['action'] == 'EXIT':
-                # 1. Try Market Bid
                 legs_list = json.loads(pos.get('legs_json', '[]'))
                 exit_price = generator.get_composite_price(legs_list, price_type='bid')
 
-                # 2. Handle Missing / Expiration
                 if exit_price <= 0.0:
                     if decision['reason'] == 'EXPIRATION':
                         exit_price = calculate_intrinsic_value(pos.get('legs_json', '[]'), current_price)
@@ -169,17 +183,34 @@ def main():
             structure_type = candidate.get('strategy', 'UNKNOWN')
             economics = candidate.get('economics', {})
 
-            # [REALISM] Entry Price (Ask)
-            entry_price = economics.get('ask', 0.0)
-            if entry_price <= 0:
-                logging.warning(f"Generator failed to price {contract_id}. Using Mid+0.05.")
-                entry_price = economics.get('entry_cost', 0.0) + 0.05
+            # --- [NEW] 1. LIQUIDITY & QUALITY GATE ---
+            bid = economics.get('bid', 0.0)
+            ask = economics.get('ask', 0.0)
 
-            max_loss = economics.get('max_loss', 0.0)
+            # Reject garbage quotes
+            if bid <= 0 or ask <= 0:
+                logging.debug(f"SKIP {contract_id}: Zero bid/ask")
+                continue
+
+            # Reject wide spreads (e.g. > $0.50 OR > 10% of price)
+            spread_width = ask - bid
+            if spread_width > 0.50 and spread_width > (ask * 0.10):
+                logging.debug(f"SKIP {contract_id}: Spread too wide (${spread_width:.2f})")
+                continue
+
+            # --- [NEW] 2. REALISTIC EXECUTION PRICING ---
+            # Paper Trade Rule: Fill at Mid + $0.02 (Conservative)
+            mid_price = (bid + ask) / 2
+            slippage = 0.02
+            entry_price = min(ask, mid_price + slippage)
+
+            # Update Max Loss based on new entry price
+            max_loss = economics.get('max_loss', entry_price)
+
             legs = candidate.get('legs', [])
             expiration = legs[0]['expiration'] if legs else "N/A"
 
-            logging.info(f"Analyzing {contract_id} (Est. Entry: ${entry_price:.2f})...")
+            logging.info(f"Analyzing {contract_id} (Mid: ${mid_price:.2f}, Entry: ${entry_price:.2f})...")
 
             # A. Monte Carlo
             mc_result = mc_engine.analyze(candidate, current_price, entry_price, trade_date=trade_date)
@@ -196,25 +227,26 @@ def main():
             # C. Allocation [FAIL CLOSED]
             if decision == 'TRADE':
                 if risk_manager:
-                    equity = getattr(Config, 'ACCOUNT_EQUITY', 10000.0)
+                    # Explicitly calculate equity from Config
+                    equity = getattr(Config, 'ACCOUNT_EQUITY', 15000.0)
                     qty, risk_details = risk_manager.allocate(candidate, equity=equity)
+
                     if qty == 0:
                         decision = 'SKIP'
-                        reason = f"Risk Blocked: {risk_details.get('blocked_by')}"
+                        reason = f"Risk Blocked: {risk_details.get('blocked_by', 'Unknown')}"
                 else:
-                    # [SAFETY FIX] Fail Closed if Risk Manager is missing
                     decision = 'SKIP'
                     reason = "Risk Manager Missing - Trading Blocked"
                     qty = 0
 
-            # D. Ledger
+            # D. Ledger Entry
             entry = {
                 'timestamp': datetime.now().isoformat(),
                 'trade_date': trade_date,
                 'contractID': contract_id,
                 'type': structure_type,
-                'entry_price': entry_price,
-                'max_loss': max_loss,
+                'entry_price': round(entry_price, 2),
+                'max_loss': round(max_loss, 2),
                 'decision': decision,
                 'reason': reason,
                 'qty_allocated': qty,
@@ -222,7 +254,16 @@ def main():
                 'CVaR95': round(mc_result.get('CVaR95', 0), 2)
             }
             ledger_entries.append(entry)
-            logging.info(f"-> Decision: {decision} | Qty: {qty} | Reason: {reason}")
+
+            # Logging status
+            log_status = decision
+            if decision == 'SKIP':
+                if "Risk Blocked" in reason:
+                    log_status = "BLOCKED (Risk)"
+                elif "Negative EV" in reason:
+                    log_status = "SKIP (Neg EV)"
+
+            logging.info(f"-> {log_status:<15} | Qty: {qty} | EV: ${entry['expected_pnl']} | Reason: {reason}")
 
             # E. Execution
             if decision == 'TRADE' and qty > 0 and trade_manager:
@@ -230,11 +271,9 @@ def main():
 
                 max_loss_per_contract = max_loss * 100
                 cvar_per_contract = abs(candidate.get('CVaR95', 0.0)) * 100
-
                 cand_symbol = candidate.get('symbol', symbol)
                 factor_map = {'TSLA': 'QQQ', 'NVDA': 'QQQ', 'AMD': 'QQQ', 'SPY': 'SPY'}
                 factor = factor_map.get(cand_symbol, 'Unmapped')
-
                 legs_json = json.dumps(legs)
 
                 position_record = {

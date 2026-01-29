@@ -1,52 +1,47 @@
+import logging
+
+
 class TradeDecisionBuilder:
     """
-    Evaluates Monte Carlo results against risk thresholds to output a GO/NO-GO decision.
-    NOW CONTRACT-AWARE: Uses explicit max_loss to detect binary gambles.
+    Evaluates Monte Carlo results to make a YES/NO trading decision.
+    Updated: Lowered thresholds to allow valid paper trades (50% WR).
     """
 
     def __init__(self):
-        # Thresholds
-        self.MIN_PROB_PROFIT = 0.60  # 60% Win Rate
-        self.MIN_EV_RATIO = 0.15  # Expect to make 15% return on risk
-        self.MAX_TAIL_RISK_RATIO = 0.90  # Reject if CVaR is > 90% of Max Loss
+        # [TUNING] Set to 0.50 to allow 50/50 bets if EV is positive.
+        self.MIN_WIN_RATE = 0.50
 
-    def evaluate(self, mc_result: dict, max_loss: float = None) -> dict:
+        # Keep EV > 0. We don't want to lose money, but even $0.01 is technically an edge.
+        self.MIN_EV = 0.00
+
+    def evaluate(self, mc_result, max_loss):
         """
-        Returns {'decision': 'TRADE'|'SKIP', 'reason': str}
+        Returns {'decision': 'TRADE'|'SKIP', 'reason': '...'}
         """
-        # 1. Unpack Metrics
-        ev = mc_result.get('expected_pnl', 0)
-        prob_profit = mc_result.get('prob_profit', 0)
-        cvar_95 = mc_result.get('CVaR95', -9999)  # Expected tail loss (negative number)
+        try:
+            expected_pnl = mc_result.get('expected_pnl', -1.0)
+            win_rate = mc_result.get('win_rate', 0.0)
 
-        # 2. Gate 1: Positive Expectancy
-        # We want the house edge, not a fair coin flip.
-        if ev <= 0:
-            return {'decision': 'SKIP', 'reason': f"Negative EV: ${ev:.2f}"}
-
-        # 3. Gate 2: Probability of Profit
-        if prob_profit < self.MIN_PROB_PROFIT:
-            return {'decision': 'SKIP', 'reason': f"Low Win Rate: {prob_profit:.1%}"}
-
-        # 4. Gate 3: Tail Risk (CVaR vs EV)
-        # Ensure the reward (EV) justifies the risk (CVaR).
-        # We generally want EV to be at least 10-15% of the average bad outcome.
-        if cvar_95 < 0:
-            risk_reward_ratio = ev / abs(cvar_95)
-            if risk_reward_ratio < 0.10:
-                return {'decision': 'SKIP', 'reason': f"Poor Risk/Reward (CVaR): {risk_reward_ratio:.2f}"}
-
-        # 5. Gate 4: "Binary Gamble" Check (The P2 Fix)
-        # If max_loss is provided, ensure we aren't risking the ENTIRE collateral
-        # just to pick up pennies. If CVaR is basically the Max Loss, it's an "All or Nothing" bet.
-        if max_loss and max_loss > 0:
-            # Calculate how much of the max_loss is consumed by the tail risk
-            tail_consumption = abs(cvar_95) / max_loss
-
-            if tail_consumption > self.MAX_TAIL_RISK_RATIO:
+            # 1. EV Check (Must be positive)
+            if expected_pnl <= self.MIN_EV:
                 return {
                     'decision': 'SKIP',
-                    'reason': f"Binary Gamble: CVaR is {tail_consumption:.1%} of Max Loss"
+                    'reason': f"Negative EV: ${expected_pnl:.2f}"
                 }
 
-        return {'decision': 'TRADE', 'reason': f"PASS | EV:${ev:.2f} | Win:{prob_profit:.1%}"}
+            # 2. Win Rate Check
+            if win_rate < self.MIN_WIN_RATE:
+                return {
+                    'decision': 'SKIP',
+                    'reason': f"Low Win Rate: {win_rate * 100:.1f}% (Req: {self.MIN_WIN_RATE * 100:.0f}%)"
+                }
+
+            # 3. Decision Passed
+            return {
+                'decision': 'TRADE',
+                'reason': f"Acceptable: EV ${expected_pnl:.2f} | WR {win_rate * 100:.1f}%"
+            }
+
+        except Exception as e:
+            logging.error(f"Decision Logic Failed: {e}")
+            return {'decision': 'ERROR', 'reason': str(e)}
