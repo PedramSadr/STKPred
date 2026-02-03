@@ -5,110 +5,109 @@ import pandas as pd
 class MonteCarloEngine:
     """
     Simulates underlying price paths to estimate Option/Spread P&L.
-    Priority 1 Fixes:
-    - Clamps P&L to spread economics (Max Gain/Max Loss).
-    - Uses trade_date for consistent DTE calculation.
-    - Computes CVaR (Conditional Value at Risk).
+    NOW SUPPORTS: Credit vs Debit logic natively.
     """
 
     def __init__(self, n_sims=5000, dt_days=1):
         self.n_sims = n_sims
-        self.dt_days = dt_days  # Step size in days
+        self.dt_days = dt_days
 
-    def analyze(self, candidate, current_price, entry_cost, trade_date=None):
+    def analyze(self, candidate, current_price, entry_cost, is_credit=False, trade_date=None):
         """
-        Runs Monte Carlo simulation with time-consistency.
+        Runs Monte Carlo simulation.
+        entry_cost: Always positive magnitude (Debit paid or Credit received).
+        is_credit: If True, PnL = Payoff + Entry_Credit (since Payoff is negative for short structures).
         """
-        # 1. Setup Time Context
+        # 1. Setup Simulation
         if trade_date:
-            current_date = pd.Timestamp(trade_date)
+            try:
+                # Handle YYYY-MM-DD format strictly
+                current_date = pd.Timestamp(str(trade_date).split(' ')[0])
+            except:
+                current_date = pd.Timestamp.now()
         else:
             current_date = pd.Timestamp.now()
 
-        # Extract Candidate Data
-        economics = candidate.get('economics', {})
-        strategy = candidate.get('strategy', 'SINGLE_PUT')
         legs = candidate.get('legs', [])
-
         if not legs: return {}
 
-        # Risk bounds (P1 Compliance: Use explicit bounds from Generator)
-        max_gain = economics.get('max_gain', float('inf'))
-        max_loss = economics.get('max_loss', entry_cost)
+        # Get Volatility (IV) from legs or default
+        # Use the first leg's IV and DTE
+        iv = float(legs[0].get('iv', 0.50))
+        dte_str = legs[0].get('expiration', '')
 
-        # Volatility & Drift (Simplified for now - can be connected to Fusion Model later)
-        # Using a fixed annual vol of 50% for TSLA paper trading if not provided
-        sigma = candidate.get('implied_volatility', 0.50)
-        mu = 0.05  # Conservative 5% annual drift
+        # Calculate DTE in years
+        try:
+            exp_date = pd.Timestamp(dte_str)
+            dte_days = (exp_date - current_date).days
+        except:
+            dte_days = 30  # Fallback
 
-        # Time to Expiration (FIX: Relative to trade_date)
-        expiration = pd.to_datetime(legs[0]['expiration'])
-        dte = (expiration - current_date).days
+        T = max(1.0 / 365.0, dte_days / 365.0)
 
-        # Safety: If trading 0-DTE or negative (data error), clamp to 1 day
-        if dte < 1: dte = 1
-        T = dte / 365.0
+        # Simulate Terminal Prices (Geometric Brownian Motion)
+        drift = -0.5 * (iv ** 2) * T
+        diffusion = iv * np.sqrt(T) * np.random.normal(0, 1, self.n_sims)
+        ST_prices = current_price * np.exp(drift + diffusion)
 
-        # 2. Simulate Paths (Geometric Brownian Motion)
-        # S_T = S_0 * exp((mu - 0.5*sigma^2)*T + sigma*sqrt(T)*Z)
-        Z = np.random.standard_normal(self.n_sims)
-        ST = current_price * np.exp((mu - 0.5 * sigma ** 2) * T + sigma * np.sqrt(T) * Z)
+        # 2. Calculate Payoff at Expiration (Net Liquidation Value)
+        payoffs = np.zeros(self.n_sims)
 
-        # 3. Calculate Payoff at Expiration
-        pnl_outcomes = []
+        for leg in legs:
+            strike = float(leg['strike'])
+            l_type = leg['type'].lower()
+            l_side = leg['side'].lower()
 
-        if 'SPREAD' in strategy or 'VERTICAL' in strategy:
-            # Vertical Spread Logic
-            long_strike = legs[0]['strike']
-            short_strike = legs[1]['strike']
+            # Value of the option leg at expiration (Always >= 0)
+            if l_type == 'call':
+                opt_val = np.maximum(0.0, ST_prices - strike)
+            else:  # put
+                opt_val = np.maximum(0.0, strike - ST_prices)
 
-            # Put Debit Spread Value = Max(0, Long_Strike - ST) - Max(0, Short_Strike - ST)
-            spread_value = np.maximum(0, long_strike - ST) - np.maximum(0, short_strike - ST)
+            # Add to spread value (Long adds equity, Short subtracts equity)
+            if l_side == 'long':
+                payoffs += opt_val
+            else:
+                payoffs -= opt_val
 
-            # PnL = Final Value - Entry Cost
-            pnl_outcomes = spread_value - entry_cost
+        # 3. Calculate P&L
+        # Logic: PnL = Final_Value - Initial_Cost
+        # Debit: Cost is positive. PnL = Payoffs - Cost
+        # Credit: Cost is negative (we received it). PnL = Payoffs - (-Credit) = Payoffs + Credit
 
+        if is_credit:
+            pnl_outcomes = payoffs + entry_cost
         else:
-            # Single Put Logic
-            strike = legs[0]['strike']
-            option_value = np.maximum(0, strike - ST)
-            pnl_outcomes = option_value - entry_cost
+            pnl_outcomes = payoffs - entry_cost
 
-        # 4. PRIORITY 1: Hard Clamp (Safety Net)
-        # Ensure floating point math didn't exceed bounds defined by the Generator
-        pnl_outcomes = np.clip(pnl_outcomes, -max_loss, max_gain)
-
-        # 5. Calculate Metrics
+        # 4. Metrics
         expected_pnl = np.mean(pnl_outcomes)
         prob_profit = np.mean(pnl_outcomes > 0)
 
-        # Downside Risk Metrics
-        losses = pnl_outcomes[pnl_outcomes < 0]
+        # CVaR (5%)
+        # CVaR is the average of the worst 5% of outcomes
+        pnl_sorted = np.sort(pnl_outcomes)
+        cutoff_index = int(self.n_sims * 0.05)
+        if cutoff_index == 0: cutoff_index = 1
+        tail = pnl_sorted[:cutoff_index]
+        cvar_95 = np.mean(tail)
 
-        # VaR (95%)
-        if len(pnl_outcomes) > 0:
-            var_95 = np.percentile(pnl_outcomes, 5)  # 5th percentile (negative number)
+        # Downside Sharpe
+        # Ratio of Mean PnL to Downside Deviation
+        downside_losses = pnl_outcomes[pnl_outcomes < 0]
+        if len(downside_losses) > 0:
+            downside_std = np.std(downside_losses)
         else:
-            var_95 = -max_loss
+            downside_std = 0.0001  # No losses? Infinite sharpe.
 
-        # CVaR (95%) - PRIORITY 1 FIX
-        # Average of losses worse than VaR (The "Tail Risk")
-        tail_losses = pnl_outcomes[pnl_outcomes <= var_95]
-        if len(tail_losses) > 0:
-            cvar_95 = np.mean(tail_losses)
-        else:
-            cvar_95 = var_95
+        if downside_std < 0.0001: downside_std = 0.0001
 
-        # Downside Sharpe (Sortino-ish)
-        downside_std = np.std(losses) if len(losses) > 0 else 1.0
-        downside_sharpe = expected_pnl / downside_std if downside_std > 0 else 0
+        sharpe = expected_pnl / downside_std
 
         return {
             'expected_pnl': expected_pnl,
             'prob_profit': prob_profit,
-            'VaR95': var_95,
-            'CVaR95': cvar_95,  # New Metric
-            'downside_sharpe': downside_sharpe,
-            'simulated_price_mean': np.mean(ST),
-            'drift': mu
+            'CVaR95': cvar_95,
+            'downside_sharpe': sharpe,  # Standardized Key
+            'sharpe': sharpe
         }
