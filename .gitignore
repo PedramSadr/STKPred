@@ -23,5 +23,6 @@ env/
 # --- Data & Config (Optional) ---
 # If you want to prevent committing your local CSV data or keys
 *.csv
-config.py
 .env
+misc.xml
+PythonProject.iml
