@@ -105,6 +105,12 @@ class MonteCarloEngine:
         T_rem_vec = np.maximum(T_exp - (t_idx * dt), 0.0)
         Opt_paths = self._black_scholes_matrix(S_paths, K, r, T_rem_vec, IV_paths, is_call)
 
+        # --- EXCURSIONS (MAE / MFE) ---
+        # Calculate max/min excursions along the paths BEFORE exit evaluation
+        pnl_paths = Opt_paths - entry_price
+        cum_max_pnl = np.maximum.accumulate(pnl_paths, axis=1)
+        cum_min_pnl = np.minimum.accumulate(pnl_paths, axis=1)
+
         # --- 4) Exits with SLIPPAGE ---
         ratios = Opt_paths / entry_price
         final_values = Opt_paths[:, -1].copy()
@@ -159,19 +165,27 @@ class MonteCarloEngine:
                 exit_day[be_exit] = t + 1
                 exit_reason[be_exit] = 3
 
-        # Apply slippage to paths held to the end (optional, usually "market close" also has friction)
-        # For fairness, we apply slippage on final hold as well to simulate "getting out"
+        # Capture MAE/MFE on the actual day the path exited
+        exit_idx = np.where(exit_day > 0, exit_day - 1, steps - 1)
+        path_indices = np.arange(self.num_paths)
+        mae_arr = cum_min_pnl[path_indices, exit_idx]
+        mfe_arr = cum_max_pnl[path_indices, exit_idx]
+
         final_values[active] = final_values[active] * fill_mult
 
         pnl = final_values - entry_price
         stats = self._compute_stats(pnl, final_values)
 
-        # Diagnostics
+        # Diagnostics & New Metrics
         stats["exit_day_mean"] = float(np.mean(np.where(exit_day < 0, steps, exit_day)))
         stats["exit_rate_tp"] = float(np.mean(exit_reason == 1))
         stats["exit_rate_sl"] = float(np.mean(exit_reason == 2))
         stats["exit_rate_be"] = float(np.mean(exit_reason == 3))
         stats["hold_rate"] = float(np.mean(exit_reason == 0))
+
+        # Inject Mean MAE / MFE into the output
+        stats["mae"] = float(np.mean(mae_arr))
+        stats["mfe"] = float(np.mean(mfe_arr))
 
         return stats
 
@@ -179,11 +193,6 @@ class MonteCarloEngine:
     # 2. TERMINAL-ONLY SIMULATION (Fast Triage)
     # ----------------------------------------------------------------
     def _simulate_terminal_only(self, fusion_output, market_state):
-        """
-        Fast 'Buy and Hold' simulation.
-        Prices ONLY at T=hold_days (or expiry).
-        Useful for A/B testing: 'Did active management beat buy-and-hold?'
-        """
         mu = float(fusion_output["mu"])
         sigma = float(fusion_output["sigma"])
         aiv = float(fusion_output["aiv"])
@@ -206,11 +215,9 @@ class MonteCarloEngine:
         if steps <= 0:
             return self._compute_stats(np.zeros(self.num_paths), np.full(self.num_paths, entry_price))
 
-        # Clamp Horizon
         max_steps = int(np.floor(T_exp / dt))
         steps_eff = min(steps, max_steps) if max_steps > 0 else 0
         if steps_eff <= 0:
-            # Expired immediately
             terminal_val = self._black_scholes_single(S0, K, r, max(T_exp, 0.0), IV0, is_call)
             return self._compute_stats(np.full(self.num_paths, terminal_val - entry_price),
                                        np.full(self.num_paths, terminal_val))
@@ -218,13 +225,11 @@ class MonteCarloEngine:
         hold_T_eff = steps_eff * dt
         T_rem = max(T_exp - hold_T_eff, 0.0)
 
-        # 1. Simulate S at Horizon (GBM)
         Z = np.random.standard_normal(self.num_paths)
         drift = (mu - 0.5 * sigma ** 2) * hold_T_eff
         diffusion = sigma * np.sqrt(hold_T_eff) * Z
         S_h = S0 * np.exp(drift + diffusion)
 
-        # 2. Simulate IV at Horizon (Random Walk Consistency)
         aiv_is_10d = bool(getattr(self.cfg, "aiv_is_10day_change", False))
         aiv_h = aiv * (steps_eff / 10.0) if aiv_is_10d else aiv
 
@@ -233,7 +238,6 @@ class MonteCarloEngine:
 
         IV_h = IV0 + aiv_h + iv_noise_h
 
-        # Apply min/cap
         iv_min = float(getattr(self.cfg, "iv_min", 0.01))
         iv_max = getattr(self.cfg, "iv_max", 3.0)
         if iv_max is None:
@@ -241,21 +245,24 @@ class MonteCarloEngine:
         else:
             IV_h = np.clip(IV_h, iv_min, float(iv_max))
 
-        # 3. Price
         terminal_vals = self._black_scholes_vectorized(S_h, K, r, T_rem, IV_h, is_call)
 
-        # 4. Apply Slippage (simulating selling at the horizon)
         fill_mult = 1.0 - float(self.cfg.slippage_pct)
         terminal_vals = terminal_vals * fill_mult
 
         pnl = terminal_vals - entry_price
-        return self._compute_stats(pnl, terminal_vals)
+        stats = self._compute_stats(pnl, terminal_vals)
+
+        # Fallback MAE/MFE mapping for terminal-only simulations
+        stats["mae"] = float(np.mean(np.minimum(pnl, 0.0)))
+        stats["mfe"] = float(np.mean(np.maximum(pnl, 0.0)))
+
+        return stats
 
     # ----------------------------------------------------------------
     # 3. STATS & MATH
     # ----------------------------------------------------------------
     def _compute_stats(self, pnl, terminal_vals):
-        """Comprehensive stats for sanity checking."""
         stats = {
             "expected_pnl": float(np.mean(pnl)),
             "expected_option_price": float(np.mean(terminal_vals)),
@@ -265,14 +272,11 @@ class MonteCarloEngine:
             "p90_value": float(np.percentile(terminal_vals, 90)),
         }
 
-        # Sharpe Calculations
         mean_pnl = np.mean(pnl)
         std_pnl = np.std(pnl)
 
-        # MC Sharpe (Mean / Std)
         stats["mc_sharpe"] = float(mean_pnl / std_pnl) if std_pnl > 1e-6 else 0.0
 
-        # Downside Sharpe (Mean / Downside Deviation)
         negative = pnl[pnl < 0]
         downside_dev = np.sqrt(np.mean(negative ** 2)) if len(negative) > 0 else 1e-6
         stats["downside_sharpe"] = float(mean_pnl / downside_dev)
@@ -295,7 +299,6 @@ class MonteCarloEngine:
         return np.where(near0, intrinsic, price)
 
     def _black_scholes_vectorized(self, S, K, r, T, sigma, is_call):
-        # Handles scalar or vector T
         if np.isscalar(T) and T <= 1e-8:
             return np.maximum(0.0, (S - K) if is_call else (K - S))
         sigma = np.maximum(sigma, 1e-8)

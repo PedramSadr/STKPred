@@ -27,6 +27,7 @@ FAIRNESS_CHECK_MODE = False
 BASE_SEED = 42
 N_SEEDS = 5
 MODEL_VERSION = "Fusion_v1.0"
+EXECUTION_SPREAD_FRACTION = 0.25  # Fraction of spread paid to get filled (0.25 = limit order slightly worse than mid)
 
 # ============================================================
 # 3. PATH & IMPORTS
@@ -157,16 +158,32 @@ else:
         print("[CRITICAL] underlying_price column missing and YFinance failed. Aborting.")
         sys.exit(1)
 
+# ============================================================
+# --- UPGRADE: INITIALIZE EXIT RULES EARLY FOR DYNAMIC DTE ---
+# ============================================================
+exit_rules = ExitRules(
+    use_path_exits=True,
+    hold_days=14,
+    take_profit_pct=0.80,
+    stop_loss_pct=0.50,
+    be_trigger_pct=0.25,
+    be_exit_buffer=0.01,
+    slippage_pct=0.01
+)
+
 # 2. GENERATE CANDIDATES
 print(f"\nGenerating candidates...")
 
 try:
+    # Dynamically scale minimum DTE based on the target holding period + 3 days buffer
+    min_dte_effective = max(10, exit_rules.hold_days + 3)
+
     gen_config = GeneratorConfig(
-        min_dte=7,
+        min_dte=min_dte_effective,
         max_dte=45,
         max_candidates=MAX_CANDIDATES,
-        min_vol=1,  # Relaxed volume filter
-        min_oi=100
+        min_vol=0,
+        min_oi=0
     )
     generator = CandidateGenerator(gen_config)
 except TypeError:
@@ -199,7 +216,6 @@ except Exception as e:
     print(f"  ⚠️ PREDICTION FAILED: {e}")
     print("  -> ACTION: Switching to FALLBACK MODE (Neutral Assumptions)")
 
-    # Define variables to avoid NameError later
     raw_mu_log = RISK_FREE_RATE
     raw_sigma = 0.40
     raw_aiv = 0.0
@@ -216,20 +232,9 @@ except Exception as e:
 # 4. SIMULATE & DECIDE
 print(f"\nStarting Evaluation ({NUM_MC_PATHS} paths x {N_SEEDS} seeds)...")
 
-exit_rules = ExitRules(
-    use_path_exits=True,
-    hold_days=14,
-    take_profit_pct=0.80,
-    stop_loss_pct=0.50,
-    be_trigger_pct=0.25,
-    be_exit_buffer=0.01,
-    slippage_pct=0.01
-)
-
 mc_engine = MonteCarloEngine(num_paths=NUM_MC_PATHS, exit_config=exit_rules)
 decision_builder = TradeDecisionBuilder()
 adapter = MarketStateAdapter(risk_free_rate=RISK_FREE_RATE)
-pred_mu = fusion_output['mu']
 
 RUN_ID = make_run_id()
 all_ledger_rows = []
@@ -238,7 +243,7 @@ accepted_trades = []
 ledger_headers = [
     "run_id", "timestamp", "trade_date", "row_id", "model_version",
     "type", "strike", "dte", "expiration", "contractID",
-    "S0", "IV0", "entry_price", "bid", "ask", "spread_pct", "volume", "open_interest",
+    "S0", "IV0", "entry_price", "mid_price", "bid", "ask", "spread_abs", "spread_pct", "volume", "open_interest",
     "mu_log_raw", "sigma_raw", "aiv_10d", "mu_arith_adj",
     "hold_days", "mc_mode", "year_days", "iv_daily_std", "iv_min", "iv_max", "slippage",
     "tp_pct", "sl_pct", "be_pct", "be_buffer",
@@ -246,7 +251,10 @@ ledger_headers = [
     "expected_pnl_std", "prob_profit_std", "downside_sharpe_std", "VaR95_std",
     "p10_value", "p90_value", "avg_exit_day",
     "TP_rate", "SL_rate", "BE_rate", "Hold_rate",
-    "decision", "reason", "seed_type", "seed_val"
+    "decision", "reason", "seed_type", "seed_val",
+    "ev_dollars", "spread_cost_dollars", "min_required_edge",
+    "limit_price", "fill_price", "slippage_vs_mid",
+    "entry_reason", "exit_reason", "mae_mean", "mfe_mean"
 ]
 
 ensure_ledger_schema(LEDGER_FILE, ledger_headers)
@@ -270,18 +278,42 @@ for idx, candidate in enumerate(candidates, start=1):
         ask = leg.get('ask', 0.0)
         vol = leg.get('volume', 0)
         oi = leg.get('open_interest', 0)
-        entry_price = market_state.get('price', 0.0)
-        mid_price = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else entry_price
 
-        # --- SYMBOL GENERATION ---
-        # Prioritize existing ID, else use CUSTOM GENERATOR
+        # Original default from data
+        raw_entry_price = market_state.get('price', 0.0)
+
+        skipped = False
+        skip_reason = ""
+        spread_abs = 0.0
+
+        if bid <= 0 or ask <= 0 or ask < bid:
+            skipped = True
+            skip_reason = "Missing/invalid quotes; cannot price execution cost"
+            mid_price = raw_entry_price
+            spread_pct = 0.0
+
+            # Purely for reporting clarity: Zero out execution logs for skipped candidates
+            limit_price = 0.0
+            fill_price = 0.0
+            slippage_vs_mid = 0.0
+            entry_price = raw_entry_price
+        else:
+            spread_abs = ask - bid
+            mid_price = (bid + ask) / 2.0
+            spread_pct = spread_abs / mid_price
+
+            # --- THE NEW EXECUTION MODEL ---
+            limit_price = mid_price + (EXECUTION_SPREAD_FRACTION * spread_abs)
+            fill_price = min(ask, limit_price)
+            slippage_vs_mid = fill_price - mid_price
+
+            # Override the pipeline's master entry price so EV and Greeks match reality
+            entry_price = fill_price
+            market_state['price'] = fill_price
+
         contract_id = leg.get("contractID")
         if not contract_id:
             contract_id = get_occ_symbol(UNDERLYING_SYMBOL, expiration, cand_type, strike)
-
-        # Spread on Mid
-        denom = mid_price if mid_price > 0 else entry_price
-        spread_pct = (ask - bid) / denom if denom > 0 else 0.0
 
         base_row = {
             "run_id": RUN_ID,
@@ -297,13 +329,15 @@ for idx, candidate in enumerate(candidates, start=1):
             "S0": f"{market_state['S']:.2f}",
             "IV0": f"{market_state['IV']:.4f}",
             "entry_price": f"{entry_price:.2f}",
+            "mid_price": f"{mid_price:.2f}",
             "bid": f"{bid:.2f}", "ask": f"{ask:.2f}",
+            "spread_abs": f"{spread_abs:.2f}",
             "spread_pct": f"{spread_pct:.4f}",
             "volume": vol, "open_interest": oi,
             "mu_log_raw": f"{raw_mu_log:.4f}",
             "sigma_raw": f"{raw_sigma:.4f}",
             "aiv_10d": f"{raw_aiv:.4f}",
-            "mu_arith_adj": f"{pred_mu:.4f}",
+            "mu_arith_adj": f"{fusion_output['mu']:.4f}",
             "hold_days": exit_rules.hold_days,
             "mc_mode": "PATH" if exit_rules.use_path_exits else "TERMINAL",
             "year_days": exit_rules.year_days,
@@ -311,23 +345,29 @@ for idx, candidate in enumerate(candidates, start=1):
             "iv_min": exit_rules.iv_min, "iv_max": exit_rules.iv_max,
             "slippage": exit_rules.slippage_pct,
             "tp_pct": exit_rules.take_profit_pct, "sl_pct": exit_rules.stop_loss_pct,
-            "be_pct": exit_rules.be_trigger_pct, "be_buffer": exit_rules.be_exit_buffer
+            "be_pct": exit_rules.be_trigger_pct, "be_buffer": exit_rules.be_exit_buffer,
+            "ev_dollars": "0.00", "spread_cost_dollars": "0.00", "min_required_edge": "0.00",
+            "limit_price": f"{limit_price:.2f}",
+            "fill_price": f"{fill_price:.2f}",
+            "slippage_vs_mid": f"{slippage_vs_mid:.2f}",
+            "entry_reason": "N/A",
+            "exit_reason": "N/A",
+            "mae_mean": "0.00",
+            "mfe_mean": "0.00"
         }
 
-        # --- DIRECTIONAL PRE-FILTER ---
-        skipped = False
-        skip_reason = ""
-        if not FAIRNESS_CHECK_MODE:
-            if pred_mu < 0 and cand_type == 'CALL':
-                skipped = True;
-                skip_reason = "CALL vs Bearish Signal"
-            if pred_mu > 0 and cand_type == 'PUT':
-                skipped = True;
-                skip_reason = "PUT vs Bullish Signal"
+        MU_EPS = 0.001
+
+        if not FAIRNESS_CHECK_MODE and not skipped:
+            if raw_mu_log < -MU_EPS and cand_type == 'CALL':
+                skipped = True
+                skip_reason = f"CALL vs Bearish Signal (raw_mu_log < {-MU_EPS})"
+            if raw_mu_log > MU_EPS and cand_type == 'PUT':
+                skipped = True
+                skip_reason = f"PUT vs Bullish Signal (raw_mu_log > {MU_EPS})"
 
         if skipped:
             print(f"  [Candidate {idx}] SKIPPED ({skip_reason})")
-            # Log SKIP
             skip_row = base_row.copy()
             skip_row.update({
                 "decision": "SKIP",
@@ -352,6 +392,7 @@ for idx, candidate in enumerate(candidates, start=1):
             downside_sharpe=agg['downside_sharpe_mean'],
             cvar=agg['VaR_95_mean'],
             premium=entry_price,
+            spread_abs=spread_abs,
             downside_sharpe_std=agg['downside_sharpe_std'],
             volatility_consistent=True,
             no_macro_events=True,
@@ -391,9 +432,19 @@ for idx, candidate in enumerate(candidates, start=1):
                 "p10_value": f"{r['p10_value']:.4f}", "p90_value": f"{r['p90_value']:.4f}",
                 "TP_rate": r.get("exit_rate_tp", 0), "SL_rate": r.get("exit_rate_sl", 0),
                 "BE_rate": r.get("exit_rate_be", 0), "Hold_rate": r.get("hold_rate", 0),
-                "avg_exit_day": r.get("exit_day_mean", 0)
+                "avg_exit_day": r.get("exit_day_mean", 0),
+                "mae_mean": f"{r.get('mae', 0.0):.2f}",
+                "mfe_mean": f"{r.get('mfe', 0.0):.2f}"
             })
             all_ledger_rows.append(full_row)
+
+        # Map Dominant Exit Reason
+        tp_r = agg.get('exit_rate_tp_mean', 0)
+        sl_r = agg.get('exit_rate_sl_mean', 0)
+        be_r = agg.get('exit_rate_be_mean', 0)
+        h_r = agg.get('hold_rate_mean', 0)
+        rates = {'TP': tp_r, 'SL': sl_r, 'BE': be_r, 'HOLD': h_r}
+        dom_exit = max(rates, key=rates.get) if max(rates.values()) > 0 else "N/A"
 
         # Add Aggregate Row
         agg_row = base_row.copy()
@@ -413,11 +464,18 @@ for idx, candidate in enumerate(candidates, start=1):
             "prob_profit_std": f"{agg['prob_profit_std']:.4f}",
             "downside_sharpe_std": f"{agg['downside_sharpe_std']:.4f}",
             "VaR95_std": f"{agg['VaR_95_std']:.4f}",
-            "TP_rate": f"{agg.get('exit_rate_tp_mean', 0):.2f}",
-            "SL_rate": f"{agg.get('exit_rate_sl_mean', 0):.2f}",
-            "BE_rate": f"{agg.get('exit_rate_be_mean', 0):.2f}",
-            "Hold_rate": f"{agg.get('hold_rate_mean', 0):.2f}",
-            "avg_exit_day": f"{agg.get('exit_day_mean_mean', 0):.1f}"
+            "TP_rate": f"{tp_r:.2f}",
+            "SL_rate": f"{sl_r:.2f}",
+            "BE_rate": f"{be_r:.2f}",
+            "Hold_rate": f"{h_r:.2f}",
+            "avg_exit_day": f"{agg.get('exit_day_mean_mean', 0):.1f}",
+            "ev_dollars": f"{decision.metrics_snapshot.get('ev_dollars', 0.0):.2f}",
+            "spread_cost_dollars": f"{decision.metrics_snapshot.get('spread_cost_dollars', 0.0):.2f}",
+            "min_required_edge": f"{decision.metrics_snapshot.get('min_required_edge', 0.0):.2f}",
+            "entry_reason": decision.reason,
+            "exit_reason": dom_exit,
+            "mae_mean": f"{agg.get('mae_mean', 0.0):.2f}",
+            "mfe_mean": f"{agg.get('mfe_mean', 0.0):.2f}"
         })
         all_ledger_rows.append(agg_row)
 
