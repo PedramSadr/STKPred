@@ -8,7 +8,7 @@ import datetime
 class DecisionType(Enum):
     TRADE = "TRADE"
     NO_TRADE = "NO_TRADE"
-    REJECT = "REJECT"  # Alias for internal rejection logic
+    REJECT = "REJECT"
 
 
 # --- 2. The Immutable Trade Decision Object ---
@@ -61,19 +61,32 @@ class TradeDecisionBuilder:
                        downside_sharpe: float,
                        cvar: float,
                        premium: float,
+                       spread_abs: float,  # <--- Required for the Killer Gate
                        downside_sharpe_std: float = 0.0,
                        volatility_consistent: bool = True,
                        no_macro_events: bool = True,
                        system_healthy: bool = True) -> TradeDecision:
 
         gates_log = []
+
+        # --- UNIT CONVERSIONS (Apples-to-Apples Contract Dollars) ---
+        # Convert expected_pnl and spread_abs from $/share to Total Contract Dollars
+        ev_dollars = expected_pnl * 100
+        spread_cost_dollars = spread_abs * 100
+        min_required_edge = 1.5 * spread_cost_dollars
+
         metrics = {
             "expected_pnl": expected_pnl,
             "prob_profit": prob_profit,
             "downside_sharpe": downside_sharpe,
             "downside_sharpe_std": downside_sharpe_std,
             "cvar": cvar,
-            "premium": premium
+            "premium": premium,
+            "spread_abs": spread_abs,
+            # Added for live debugging/auditing
+            "ev_dollars": ev_dollars,
+            "spread_cost_dollars": spread_cost_dollars,
+            "min_required_edge": min_required_edge
         }
 
         # --- GATING RULES ---
@@ -83,10 +96,18 @@ class TradeDecisionBuilder:
         if not no_macro_events: return self._reject("Macro Event Risk", metrics, gates_log)
         if not volatility_consistent: return self._reject("Vol Regime Mismatch", metrics, gates_log)
 
-        # 1. P&L > 0
+        # 1. Base P&L Check
         if expected_pnl <= 0:
             return self._reject(f"Negative Expectancy: {expected_pnl:.2f}", metrics, gates_log)
         gates_log.append("PASS: Expected P&L > 0")
+
+        # 1.5 THE KILLER GATE: EV vs Spread Cost
+        if ev_dollars < min_required_edge:
+            return self._reject(
+                f"Edge too small: EV (${ev_dollars:.2f}) < 1.5x Spread Cost (${min_required_edge:.2f})",
+                metrics, gates_log
+            )
+        gates_log.append(f"PASS: EV (${ev_dollars:.2f}) >= 1.5x Spread Cost (${min_required_edge:.2f})")
 
         # 2. PoP >= 0.40
         if prob_profit < 0.40:
@@ -97,9 +118,12 @@ class TradeDecisionBuilder:
         TARGET_SHARPE = 0.35
         GRAY_ZONE_FLOOR = 0.34
 
+        # -------------------------------------------------------------
+        # ALL THRESHOLDS NOW USE NORMALIZED TOTAL CONTRACT DOLLARS
+        # -------------------------------------------------------------
         GRAY_POP_THRESH = 0.42
-        GRAY_PNL_THRESH = 4.5
-        EPS = 1e-9  # Handle float precision
+        GRAY_PNL_THRESH = 450.0  # $450 total expected profit per contract
+        EPS = 1e-9
 
         is_gray_zone = False
         is_extended_gray_zone = False
@@ -113,9 +137,9 @@ class TradeDecisionBuilder:
                 is_extended_gray_zone = True
 
             if is_gray_zone or is_extended_gray_zone:
-                # Check Aux with Epsilon
                 pop_ok = (prob_profit + EPS) >= GRAY_POP_THRESH
-                pnl_ok = (expected_pnl + EPS) >= GRAY_PNL_THRESH
+                # FIX: Now comparing unit-consistent ev_dollars against contract dollar threshold
+                pnl_ok = (ev_dollars + EPS) >= GRAY_PNL_THRESH
 
                 if not (pop_ok and pnl_ok):
                     zone_type = "Extended Gray Zone" if is_extended_gray_zone else "Gray Zone"
@@ -124,9 +148,7 @@ class TradeDecisionBuilder:
 
                     reason = (
                         f"Downside Sharpe {downside_sharpe:.3f} in {zone_type} (std={downside_sharpe_std:.3f}). "
-                        f"Override Failed: "
-                        f"PoP: {pop_status} ({prob_profit:.4f} vs {GRAY_POP_THRESH}), "
-                        f"PnL: {pnl_status} ({expected_pnl:.4f} vs {GRAY_PNL_THRESH})"
+                        f"Override Failed: PoP: {pop_status}, PnL: {pnl_status}"
                     )
                     return self._reject(reason, metrics, gates_log)
                 else:
@@ -134,7 +156,7 @@ class TradeDecisionBuilder:
                     gates_log.append(f"PASS: Downside Sharpe {downside_sharpe:.3f} ({msg})")
             else:
                 return self._reject(
-                    f"Downside Sharpe {downside_sharpe:.3f} + std {downside_sharpe_std:.3f} < {GRAY_ZONE_FLOOR} (Hard Floor)",
+                    f"Downside Sharpe {downside_sharpe:.3f} + std {downside_sharpe_std:.3f} < {GRAY_ZONE_FLOOR}",
                     metrics, gates_log
                 )
 
