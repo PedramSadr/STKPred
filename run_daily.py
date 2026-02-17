@@ -103,10 +103,10 @@ if not available_dates:
 TRADE_DATE = available_dates[-1]
 print(f"Target Trade Date Resolved: {TRADE_DATE}")
 
-# Staleness Check
-days_lag = (today - TRADE_DATE).days
-if days_lag > 3:
-    print(f"\n[CRITICAL ERROR] Data is stale by {days_lag} days!")
+# Staleness Check (Upgraded to Business Days)
+b_days_lag = np.busday_count(str(TRADE_DATE), str(today))
+if b_days_lag > 2:  # 2 business days safely covers a 3-day holiday weekend
+    print(f"\n[CRITICAL ERROR] Data is stale by {b_days_lag} business days!")
     print(f"  Latest available date: {TRADE_DATE}")
     sys.exit(1)
 
@@ -442,7 +442,7 @@ for idx, candidate in enumerate(candidates, start=1):
         tp_r = agg.get('exit_rate_tp_mean', 0)
         sl_r = agg.get('exit_rate_sl_mean', 0)
         be_r = agg.get('exit_rate_be_mean', 0)
-        h_r = agg.get('hold_rate_mean', 0)
+        h_r  = agg.get('hold_rate_mean', 0)
         rates = {'TP': tp_r, 'SL': sl_r, 'BE': be_r, 'HOLD': h_r}
         dom_exit = max(rates, key=rates.get) if max(rates.values()) > 0 else "N/A"
 
