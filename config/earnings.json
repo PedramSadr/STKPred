@@ -1,0 +1,49 @@
+{
+  "schema_version": "1.0",
+  "records": [
+    {
+      "ticker": "TSLA",
+      "fiscal_quarter": "Q4 2025 (reported in 2026)",
+      "expected_window_start": "2026-01-15",
+      "expected_window_end": "2026-02-05",
+      "confirmed_date": "",
+      "confirmed_time_et": "",
+      "status": "TBD",
+      "source": "historical pattern (late Jan/early Feb)",
+      "notes": "Update with confirmed earnings date/time when announced; consider blacklisting T-1, T, and T+1 trading days."
+    },
+    {
+      "ticker": "TSLA",
+      "fiscal_quarter": "Q1 2026",
+      "expected_window_start": "2026-04-10",
+      "expected_window_end": "2026-04-30",
+      "confirmed_date": "",
+      "confirmed_time_et": "",
+      "status": "TBD",
+      "source": "historical pattern (mid/late Apr)",
+      "notes": "Update with confirmed earnings date/time when announced; consider blacklisting T-1, T, and T+1."
+    },
+    {
+      "ticker": "TSLA",
+      "fiscal_quarter": "Q2 2026",
+      "expected_window_start": "2026-07-10",
+      "expected_window_end": "2026-07-30",
+      "confirmed_date": "",
+      "confirmed_time_et": "",
+      "status": "TBD",
+      "source": "historical pattern (mid/late Jul)",
+      "notes": "Update with confirmed earnings date/time when announced."
+    },
+    {
+      "ticker": "TSLA",
+      "fiscal_quarter": "Q3 2026",
+      "expected_window_start": "2026-10-10",
+      "expected_window_end": "2026-10-30",
+      "confirmed_date": "",
+      "confirmed_time_et": "",
+      "status": "TBD",
+      "source": "historical pattern (mid/late Oct)",
+      "notes": "Update with confirmed earnings date/time when announced."
+    }
+  ]
+}

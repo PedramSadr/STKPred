@@ -30,12 +30,13 @@ class ConfidenceCalculator:
 
     CAP_DOWNSIDE_SHARPE = 3.0
     CAP_POP = 0.90
-    CAP_PNL = 500.0
+    CAP_PNL = 500.0  # <--- This is Contract Dollars ($500)
 
-    def calculate(self, prob_profit: float, downside_sharpe: float, expected_pnl: float) -> float:
+    def calculate(self, prob_profit: float, downside_sharpe: float, ev_dollars: float) -> float:
         norm_sharpe = self._normalize(downside_sharpe, 0.0, self.CAP_DOWNSIDE_SHARPE)
         norm_pop = self._normalize(prob_profit, 0.0, self.CAP_POP)
-        norm_pnl = self._normalize(expected_pnl, 0.0, self.CAP_PNL)
+        # FIX 1: Scoring now uses ev_dollars so it correctly maps against the 500.0 cap
+        norm_pnl = self._normalize(ev_dollars, 0.0, self.CAP_PNL)
 
         raw_score = (
                 (norm_sharpe * self.WEIGHT_DOWNSIDE_SHARPE) +
@@ -61,7 +62,7 @@ class TradeDecisionBuilder:
                        downside_sharpe: float,
                        cvar: float,
                        premium: float,
-                       spread_abs: float,  # <--- Required for the Killer Gate
+                       spread_abs: float,
                        downside_sharpe_std: float = 0.0,
                        volatility_consistent: bool = True,
                        no_macro_events: bool = True,
@@ -69,22 +70,29 @@ class TradeDecisionBuilder:
 
         gates_log = []
 
-        # --- UNIT CONVERSIONS (Apples-to-Apples Contract Dollars) ---
-        # Convert expected_pnl and spread_abs from $/share to Total Contract Dollars
+        # =========================================================================
+        # THE ONE CLEAN RULE: NORMALIZE EVERYTHING TO TOTAL CONTRACT DOLLARS (x100)
+        # =========================================================================
+        # We assume expected_pnl, premium, cvar, and spread_abs arrive as $/share.
         ev_dollars = expected_pnl * 100
+        premium_dollars = premium * 100
+        cvar_dollars = cvar * 100
         spread_cost_dollars = spread_abs * 100
+
+        # Friction multiplier: Set to 1.5 assuming aggressive market orders or slippage
         min_required_edge = 1.5 * spread_cost_dollars
 
         metrics = {
-            "expected_pnl": expected_pnl,
+            "expected_pnl_share": expected_pnl,
+            "cvar_share": cvar,
+            "premium_share": premium,
+            "spread_abs_share": spread_abs,
             "prob_profit": prob_profit,
             "downside_sharpe": downside_sharpe,
             "downside_sharpe_std": downside_sharpe_std,
-            "cvar": cvar,
-            "premium": premium,
-            "spread_abs": spread_abs,
-            # Added for live debugging/auditing
             "ev_dollars": ev_dollars,
+            "premium_dollars": premium_dollars,
+            "cvar_dollars": cvar_dollars,
             "spread_cost_dollars": spread_cost_dollars,
             "min_required_edge": min_required_edge
         }
@@ -97,9 +105,9 @@ class TradeDecisionBuilder:
         if not volatility_consistent: return self._reject("Vol Regime Mismatch", metrics, gates_log)
 
         # 1. Base P&L Check
-        if expected_pnl <= 0:
-            return self._reject(f"Negative Expectancy: {expected_pnl:.2f}", metrics, gates_log)
-        gates_log.append("PASS: Expected P&L > 0")
+        if ev_dollars <= 0:
+            return self._reject(f"Negative Expectancy: ${ev_dollars:.2f}", metrics, gates_log)
+        gates_log.append("PASS: Expected P&L > $0")
 
         # 1.5 THE KILLER GATE: EV vs Spread Cost
         if ev_dollars < min_required_edge:
@@ -117,10 +125,6 @@ class TradeDecisionBuilder:
         # 3. Downside Sharpe (Gray Zone Logic)
         TARGET_SHARPE = 0.35
         GRAY_ZONE_FLOOR = 0.34
-
-        # -------------------------------------------------------------
-        # ALL THRESHOLDS NOW USE NORMALIZED TOTAL CONTRACT DOLLARS
-        # -------------------------------------------------------------
         GRAY_POP_THRESH = 0.42
         GRAY_PNL_THRESH = 450.0  # $450 total expected profit per contract
         EPS = 1e-9
@@ -138,7 +142,6 @@ class TradeDecisionBuilder:
 
             if is_gray_zone or is_extended_gray_zone:
                 pop_ok = (prob_profit + EPS) >= GRAY_POP_THRESH
-                # FIX: Now comparing unit-consistent ev_dollars against contract dollar threshold
                 pnl_ok = (ev_dollars + EPS) >= GRAY_PNL_THRESH
 
                 if not (pop_ok and pnl_ok):
@@ -148,7 +151,7 @@ class TradeDecisionBuilder:
 
                     reason = (
                         f"Downside Sharpe {downside_sharpe:.3f} in {zone_type} (std={downside_sharpe_std:.3f}). "
-                        f"Override Failed: PoP: {pop_status}, PnL: {pnl_status}"
+                        f"Override Failed: PoP: {pop_status}, PnL: {pnl_status} (${ev_dollars:.2f} vs ${GRAY_PNL_THRESH})"
                     )
                     return self._reject(reason, metrics, gates_log)
                 else:
@@ -160,12 +163,15 @@ class TradeDecisionBuilder:
                     metrics, gates_log
                 )
 
-        # 4. Tail Risk
-        if abs(cvar) > 3.0 * premium and premium > 0:
-            return self._reject("Extreme Tail Risk (CVaR > 3x Premium)", metrics, gates_log)
+        # 4. Tail Risk (FIX 2: Apples-to-Apples Contract Dollars Comparison)
+        if abs(cvar_dollars) > 3.0 * premium_dollars and premium_dollars > 0:
+            return self._reject(
+                f"Extreme Tail Risk: CVaR (${abs(cvar_dollars):.2f}) > 3x Premium (${premium_dollars:.2f})", metrics,
+                gates_log)
         gates_log.append("PASS: CVaR Limit")
 
-        score = self.calculator.calculate(prob_profit, downside_sharpe, expected_pnl)
+        # FIX 1: Pass ev_dollars directly into the confidence calculator
+        score = self.calculator.calculate(prob_profit, downside_sharpe, ev_dollars)
 
         return TradeDecision(DecisionType.TRADE, score, datetime.datetime.now(), "All deterministic gates passed.",
                              metrics, gates_log)

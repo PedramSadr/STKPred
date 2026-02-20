@@ -9,6 +9,7 @@ from typing import TypedDict, List, Literal, Optional
 LOG_DIR = r"C:\My Documents\Mics\Logs"
 os.makedirs(LOG_DIR, exist_ok=True)
 LOG_FILE = os.path.join(LOG_DIR, "candidate_generator.log")
+EVAL_LOG_FILE = os.path.join(LOG_DIR, "candidate_evaluation_log.csv")
 
 logging.basicConfig(
     filename=LOG_FILE,
@@ -40,9 +41,11 @@ class OptionLeg(TypedDict):
 class CandidateTrade(TypedDict):
     date: str
     structure: str
-    type: str
+    structure_type: str
     underlying_price: float
     legs: List[OptionLeg]
+    decision: str
+    block_reason: str
 
 
 IV_COL = "implied_volatility"
@@ -51,7 +54,7 @@ IV_COL = "implied_volatility"
 @dataclass
 class GeneratorConfig:
     min_dte: int = 7
-    max_dte: int = 45
+    max_dte: int = 90  # Expanded window for single-leg swings
     min_vol: int = 1
     min_oi: int = 1
     max_candidates: int = 30
@@ -80,7 +83,9 @@ class CandidateGenerator:
         logging.info(f"Catalog loaded successfully with {len(df)} rows.")
         return df
 
-    def generate(self, catalog_df: pd.DataFrame, trade_date: str = None) -> List[CandidateTrade]:
+    # FIX 1: Added optional spot_price parameter to explicitly catch missing data
+    def generate(self, catalog_df: pd.DataFrame, trade_date: str = None, spot_price: float = None) -> List[
+        CandidateTrade]:
         logging.info(f"Starting candidate generation. Trade Date: {trade_date}")
 
         if trade_date:
@@ -96,7 +101,7 @@ class CandidateGenerator:
             logging.warning("DataFrame is empty after date filter.")
             return []
 
-        # --- FIX 1: Normalize Columns ---
+        # --- Normalize Columns ---
         column_mapping = {
             'underlying': 'underlying_price',
             'spot': 'underlying_price',
@@ -106,7 +111,28 @@ class CandidateGenerator:
         }
         df = df.rename(columns=column_mapping)
 
-        # --- FIX 2: Calculate Missing DTE ---
+        # FIX 1: Explicitly fill underlying_price if passed via generate()
+        if spot_price is not None and spot_price > 0:
+            if 'underlying_price' not in df.columns:
+                df['underlying_price'] = spot_price
+            else:
+                df['underlying_price'] = df['underlying_price'].fillna(spot_price)
+
+        # ---------------------------------------------------------
+        # GUARD 1: Explicitly check for required structural columns
+        # ---------------------------------------------------------
+        required_cols = ["expiration", "type", "strike", "bid", "ask"]
+        missing_cols = [c for c in required_cols if c not in df.columns]
+        if missing_cols:
+            logging.error(f"CRITICAL: Missing required columns in feed: {missing_cols}. Aborting generation.")
+            return []
+
+        # ---------------------------------------------------------
+        # GUARD 2: Normalize option type early
+        # ---------------------------------------------------------
+        df["type"] = df["type"].astype(str).str.lower().str.strip()
+
+        # Calculate DTE & Verify core columns
         if 'dte' not in df.columns:
             if 'expiration' in df.columns and 'date' in df.columns:
                 df['expiration'] = pd.to_datetime(df['expiration'], errors='coerce')
@@ -114,62 +140,92 @@ class CandidateGenerator:
                 df['dte'] = (df['expiration'] - df['date']).dt.days
                 df['dte'] = df['dte'].fillna(-1).astype(int)
             else:
-                logging.warning("CRITICAL WARNING: 'dte' column missing and cannot be calculated.")
                 df['dte'] = -1
 
-        # --- FIX 3: Ensure Underlying Price Exists ---
         if 'underlying_price' not in df.columns:
-            logging.warning("CRITICAL WARNING: 'underlying_price' column missing.")
             df['underlying_price'] = np.nan
 
         if IV_COL not in df.columns:
             if 'iv' in df.columns:
                 df = df.rename(columns={'iv': IV_COL})
             else:
-                logging.error(f"CRITICAL: Missing required column '{IV_COL}'.")
                 return []
 
         df[IV_COL] = pd.to_numeric(df[IV_COL], errors='coerce')
         df = df[(df[IV_COL] > 0) & (df[IV_COL] < 3.0)]
 
-        core_cols = ['dte', 'volume', 'open_interest', 'strike', 'underlying_price', 'opt_price', 'bid', 'ask']
+        core_cols = ['dte', 'open_interest', 'strike', 'underlying_price', 'opt_price', 'bid', 'ask']
         for col in core_cols:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
 
-        cols_to_check = ['dte', 'strike', 'underlying_price', 'opt_price']
-        missing_mask = df[cols_to_check].isna().any(axis=1)
-        if missing_mask.any():
-            df = df.dropna(subset=cols_to_check)
-
-        for col in ['delta', 'vega', 'gamma']:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+        # FIX 1: Removed 'underlying_price' from dropna to let it hit Gate 2 properly
+        cols_to_check = ['dte', 'strike']
+        df = df.dropna(subset=cols_to_check)
 
         # =========================================================
-        # --- NEW STRUCTURAL & TIERED LIQUIDITY GATES ---
+        # EARLY AUDIT INITIALIZATION
         # =========================================================
+        df["decision"] = "TRADE"
+        df["block_reason"] = "OK"
 
-        # 1. QUOTE SANITY GATES
-        df = df.dropna(subset=["bid", "ask", "underlying_price", "strike"])
-        df = df[(df["bid"] > 0) & (df["ask"] > 0) & (df["ask"] >= df["bid"])]
+        # ---------------------------------------------------------
+        # GATE 0: INVALID OPTION TYPE
+        # ---------------------------------------------------------
+        bad_type = ~df["type"].isin(['call', 'put'])
+        df.loc[bad_type, "decision"] = "BLOCK"
+        df.loc[bad_type, "block_reason"] = "G0_Invalid_Type"
 
-        # 2. ATM DISTANCE (Tightened to 10% to save compute)
-        spot = df["underlying_price"]
+        # ---------------------------------------------------------
+        # GATE 1: QUOTE SANITY
+        # ---------------------------------------------------------
+        bad_quotes = df["bid"].isna() | df["ask"].isna() | (df["bid"] <= 0) | (df["ask"] <= 0) | (df["ask"] < df["bid"])
+        df.loc[bad_quotes & (df["decision"] == "TRADE"), "decision"] = "BLOCK"
+        df.loc[bad_quotes & (df["block_reason"] == "OK"), "block_reason"] = "G1_Bad_Quotes"
+
+        # ---------------------------------------------------------
+        # GATE 2: UNDERLYING PRICE > 0 GUARD
+        # ---------------------------------------------------------
+        bad_spot = df["underlying_price"].isna() | (df["underlying_price"] <= 0)
+        df.loc[bad_spot & (df["decision"] == "TRADE"), "decision"] = "BLOCK"
+        df.loc[bad_spot & (df["block_reason"] == "OK"), "block_reason"] = "G2_Invalid_Spot"
+
+        # ---------------------------------------------------------
+        # GATE 3: OTM DISTANCE (Single-Leg Friendly)
+        # ---------------------------------------------------------
+        spot = np.where(df["underlying_price"] > 0, df["underlying_price"], np.nan)
+
+        # Keep tracking absolute relative distance for the audit log
         df["rel_distance"] = (df["strike"] - spot).abs() / spot
-        df = df[df["rel_distance"] <= 0.10]
 
-        # 3. NO-ARBITRAGE PRICE GATES
-        spot = df["underlying_price"]  # <--- CRITICAL FIX: Re-sync spot size after filtering
+        MAX_OTM = 0.20
+
+        # Only penalize far OTM contracts, preserving deep ITM options
+        call_too_far_otm = (df["type"] == "call") & (df["strike"] > spot) & (((df["strike"] - spot) / spot) > MAX_OTM)
+        put_too_far_otm = (df["type"] == "put") & (df["strike"] < spot) & (((spot - df["strike"]) / spot) > MAX_OTM)
+
+        far_otm = call_too_far_otm | put_too_far_otm
+
+        df.loc[far_otm & (df["decision"] == "TRADE"), "decision"] = "BLOCK"
+        df.loc[far_otm & (df["block_reason"] == "OK"), "block_reason"] = "G3_Too_Far_OTM"
+
+        # ---------------------------------------------------------
+        # GATE 4: ARBITRAGE BOUNDS
+        # ---------------------------------------------------------
         K = df["strike"]
-        t = df["type"].astype(str).str.lower()
+        t = df["type"]
         is_call = t == "call"
 
         intrinsic = np.where(is_call, np.maximum(spot - K, 0), np.maximum(K - spot, 0))
         upper = np.where(is_call, spot, K)
-        df = df[(df["ask"] >= 0.95 * intrinsic) & (df["ask"] <= 1.05 * upper)]
 
-        # 4. TIERED LIQUIDITY GATES
+        arb_fail = (df["ask"] < 0.95 * intrinsic) | (df["ask"] > 1.05 * upper)
+        df.loc[arb_fail & (df["decision"] == "TRADE"), "decision"] = "BLOCK"
+        df.loc[arb_fail & (df["block_reason"] == "OK"), "block_reason"] = "G4_Arb_Bounds_Failed"
+
+        # ---------------------------------------------------------
+        # GATE 5: TIERED LIQUIDITY GATES
+        # ---------------------------------------------------------
         mid = (df["bid"] + df["ask"]) / 2.0
         spread_abs = df["ask"] - df["bid"]
         spread_pct = np.where(mid > 0, spread_abs / mid, 1.0)
@@ -179,51 +235,84 @@ class CandidateGenerator:
         cond_t3_fail = (mid >= 1.00) & ((spread_pct > 0.03) | (spread_abs > np.maximum(0.10, 0.02 * mid)))
 
         reject_mask = cond_t1_fail | cond_t2_fail | cond_t3_fail
+        reasons = np.select(
+            [cond_t1_fail, cond_t2_fail, cond_t3_fail],
+            ["G5_T1_CHEAP", "G5_T2_NORMAL", "G5_T3_EXPENSIVE"],
+            default="OK"
+        )
+        df.loc[reject_mask & (df["decision"] == "TRADE"), "block_reason"] = reasons[
+            reject_mask & (df["decision"] == "TRADE")]
+        df.loc[reject_mask & (df["decision"] == "TRADE"), "decision"] = "BLOCK"
 
-        if reject_mask.any():
-            reasons = np.select(
-                [cond_t1_fail, cond_t2_fail, cond_t3_fail],
-                ["T1_CHEAP_FAIL", "T2_NORMAL_FAIL", "T3_EXPENSIVE_FAIL"],
-                default="OK"
-            )
-            reject_counts = pd.Series(reasons[reject_mask]).value_counts().to_dict()
-            logging.info(f"Rejected {reject_mask.sum()} rows due to Tiered Liquidity. Breakdown: {reject_counts}")
-            df = df[~reject_mask]
-
-        # 5. CONDITIONAL VOLUME/OI
+        # ---------------------------------------------------------
+        # GATE 6: COVERAGE-AWARE VOL/OI
+        # ---------------------------------------------------------
         if "open_interest" in df.columns:
+            active_min_oi = self.cfg.min_oi
             oi_nonzero = (df["open_interest"].fillna(0) > 0).mean()
             if oi_nonzero < 0.20:
                 logging.warning("OI coverage < 20%; skipping OI filter today.")
-                self.cfg.min_oi = 0
+                active_min_oi = 0
+
+            oi_fail = (df['open_interest'] < active_min_oi)
+            df.loc[oi_fail & (df["decision"] == "TRADE"), "decision"] = "BLOCK"
+            df.loc[oi_fail & (df["block_reason"] == "OK"), "block_reason"] = "G6_Low_OI"
+        else:
+            logging.warning("Missing open_interest column; skipping OI gate.")
 
         if "volume" in df.columns:
+            active_min_vol = self.cfg.min_vol
             vol_nonzero = (df["volume"].fillna(0) > 0).mean()
             if vol_nonzero < 0.20:
                 logging.warning("Volume coverage < 20%; skipping Volume filter today.")
-                self.cfg.min_vol = 0
-        # =========================================================
+                active_min_vol = 0
 
-        # Apply Final Constraints
-        mask = (
-                (df['dte'] >= self.cfg.min_dte) &
-                (df['dte'] <= self.cfg.max_dte) &
-                (df['volume'] >= self.cfg.min_vol) &
-                (df['open_interest'] >= self.cfg.min_oi)
-        )
-        df = df[mask]
-        logging.info(f"{len(df)} rows remaining after filters.")
+            vol_fail = (df['volume'] < active_min_vol)
+            df.loc[vol_fail & (df["decision"] == "TRADE"), "decision"] = "BLOCK"
+            df.loc[vol_fail & (df["block_reason"] == "OK"), "block_reason"] = "G6_Low_Volume"
+        else:
+            logging.warning("Missing volume column; skipping volume gate.")
+
+        # ---------------------------------------------------------
+        # GATE 7: DTE BOUNDS
+        # ---------------------------------------------------------
+        dte_fail = (df['dte'] < self.cfg.min_dte) | (df['dte'] > self.cfg.max_dte)
+        df.loc[dte_fail & (df["decision"] == "TRADE"), "decision"] = "BLOCK"
+        df.loc[dte_fail & (df["block_reason"] == "OK"), "block_reason"] = "G7_DTE_Out_Of_Bounds"
+
+        # =========================================================
+        # WRITE ENHANCED EVALUATION CSV LOG (STABLE SCHEMA)
+        # =========================================================
+        audit_cols = ["date", "expiration", "type", "strike", "underlying_price", "dte", "bid", "ask", "mid",
+                      "spread_abs", "spread_pct", "rel_distance", "volume", "open_interest", "decision", "block_reason"]
+
+        audit_temp = df.copy()
+        audit_temp["mid"] = mid
+        audit_temp["spread_abs"] = spread_abs
+        audit_temp["spread_pct"] = spread_pct
+
+        audit_df = audit_temp.reindex(columns=audit_cols)
+
+        if not os.path.exists(EVAL_LOG_FILE):
+            audit_df.to_csv(EVAL_LOG_FILE, index=False)
+        else:
+            audit_df.to_csv(EVAL_LOG_FILE, mode='a', header=False, index=False)
+
+        logging.info(f"Wrote {len(audit_df)} rows to evaluation log.")
+
+        # =========================================================
+        # FILTER df_trades = df[df.decision=="TRADE"]
+        # =========================================================
+        df_trades = df[df["decision"] == "TRADE"].copy()
+        logging.info(f"{len(df_trades)} candidates passed all filters.")
 
         candidates: List[CandidateTrade] = []
 
         # Generate Candidates per Expiration
-        for expiry, group in df.groupby('expiration'):
-            current_price = group['underlying_price'].iloc[0]
+        for expiry, group in df_trades.groupby('expiration'):
+            current_price = group['underlying_price'].median()
 
             group = group.copy()
-            if 'type' in group.columns:
-                group['type'] = group['type'].astype(str).str.lower()
-
             calls = group[group['type'] == 'call'].sort_values('strike')
             puts = group[group['type'] == 'put'].sort_values('strike')
 
@@ -231,18 +320,22 @@ class CandidateGenerator:
 
             # --- SINGLE LEGS (ATM) ---
             if not calls.empty:
-                idx = (calls['strike'] - current_price).abs().argsort()[:1]
-                atm_call = calls.iloc[idx]
-                if not atm_call.empty:
-                    self._try_add_candidate(candidates, "ATM Call", "Single", [atm_call.iloc[0]], current_price)
+                # FIX 3: Using clean idxmin() instead of argsort()
+                idx = (calls['strike'] - current_price).abs().idxmin()
+                atm_call = calls.loc[idx]
+                if isinstance(atm_call, pd.DataFrame):
+                    atm_call = atm_call.iloc[0]
+                self._try_add_candidate(candidates, "ATM Call", "Single", [atm_call], current_price)
 
             if not puts.empty:
-                idx = (puts['strike'] - current_price).abs().argsort()[:1]
-                atm_put = puts.iloc[idx]
-                if not atm_put.empty:
-                    self._try_add_candidate(candidates, "ATM Put", "Single", [atm_put.iloc[0]], current_price)
+                # FIX 3: Using clean idxmin() instead of argsort()
+                idx = (puts['strike'] - current_price).abs().idxmin()
+                atm_put = puts.loc[idx]
+                if isinstance(atm_put, pd.DataFrame):
+                    atm_put = atm_put.iloc[0]
+                self._try_add_candidate(candidates, "ATM Put", "Single", [atm_put], current_price)
 
-            # --- VERTICAL SPREADS (Gated) ---
+            # --- SPREADS (GATED) ---
             if self.ENABLE_SPREADS:
                 if len(calls) > 2:
                     if not (calls['strike'] - current_price).abs().empty:
@@ -269,47 +362,57 @@ class CandidateGenerator:
         return candidates[:self.cfg.max_candidates]
 
     def _try_add_candidate(self, candidates_list, name, struct_type, legs, spot):
+        # FIX 2: Added KeyError to catch block
         try:
-            raw_date = legs[0]['date']
+            raw_date = legs[0]['date'] if 'date' in legs[0] else None
             clean_legs = [self._clean_leg(legs[0], side='long')]
-            cand = self._make_candidate(name, struct_type, clean_legs, spot, raw_date)
+            cand = self._make_candidate(name, struct_type, clean_legs, spot, raw_date, legs[0])
             self._validate_candidate(cand)
             candidates_list.append(cand)
-        except (ValueError, IndexError) as e:
+        except (ValueError, IndexError, KeyError) as e:
             logging.debug(f"Failed to add candidate {name}: {e}")
             pass
 
     def _try_add_spread(self, candidates_list, name, struct_type, raw_legs, sides, spot):
+        # FIX 2: Added KeyError to catch block
         try:
-            raw_date = raw_legs[0]['date']
+            raw_date = raw_legs[0]['date'] if 'date' in raw_legs[0] else None
             clean_legs = []
             for raw_leg, side in zip(raw_legs, sides):
                 clean_legs.append(self._clean_leg(raw_leg, side=side))
-            cand = self._make_candidate(name, struct_type, clean_legs, spot, raw_date)
+            cand = self._make_candidate(name, struct_type, clean_legs, spot, raw_date, raw_legs[0])
             self._validate_candidate(cand)
             candidates_list.append(cand)
-        except (ValueError, IndexError) as e:
+        except (ValueError, IndexError, KeyError) as e:
             logging.debug(f"Failed to add spread {name}: {e}")
             pass
 
-    def _make_candidate(self, name, struct_type, legs, underlying_price, date_val) -> CandidateTrade:
-        if not isinstance(date_val, pd.Timestamp):
-            date_val = pd.to_datetime(date_val)
+    def _make_candidate(self, name, struct_type, legs, underlying_price, date_val, raw_row) -> CandidateTrade:
+        if pd.isna(date_val) or date_val is None:
+            date_str = ""
+        elif not isinstance(date_val, pd.Timestamp):
+            date_str = pd.to_datetime(date_val).strftime('%Y-%m-%d')
+        else:
+            date_str = date_val.strftime('%Y-%m-%d')
+
         return {
-            "date": date_val.strftime('%Y-%m-%d'),
+            "date": date_str,
             "structure": name,
-            "type": struct_type,
+            "structure_type": struct_type,
             "underlying_price": float(underlying_price),
+            "decision": raw_row.get("decision", "TRADE"),
+            "block_reason": raw_row.get("block_reason", "OK"),
             "legs": legs
         }
 
     def _clean_leg(self, row, side: Literal['long', 'short'] = 'long') -> OptionLeg:
         iv = float(row[IV_COL])
 
-        if 'opt_price' in row and not pd.isna(row['opt_price']):
-            entry = float(row['opt_price'])
-        elif 'bid' in row and 'ask' in row and not pd.isna(row['bid']):
+        if 'bid' in row and 'ask' in row and not pd.isna(row['bid']) and not pd.isna(row['ask']) and float(
+                row['ask']) > 0:
             entry = (float(row['bid']) + float(row['ask'])) / 2.0
+        elif 'opt_price' in row and not pd.isna(row['opt_price']):
+            entry = float(row['opt_price'])
         else:
             entry = 0.0
 
@@ -346,7 +449,7 @@ class CandidateGenerator:
             if leg['entry_price'] <= 0:
                 raise ValueError(f"Invalid Entry Price: {leg['entry_price']}")
             if leg['dte'] <= 0:
-                pass
+                raise ValueError(f"Invalid DTE: {leg['dte']}")
 
 
 if __name__ == "__main__":

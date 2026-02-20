@@ -1,111 +1,74 @@
-import os
-import zlib
-import time
-import numpy as np
 import pandas as pd
-from datetime import datetime
-
-# Metrics to aggregate (Mean + Std)
-AGG_KEYS = [
-    "expected_option_price", "expected_pnl", "prob_profit", "VaR_95",
-    "mc_sharpe", "downside_sharpe", "p10_value", "p90_value",
-    "exit_rate_tp", "exit_rate_sl", "exit_rate_be", "hold_rate", "exit_day_mean"
-]
+import numpy as np
+import os
+import uuid
 
 
-def stable_seed(contract_id: str, base_seed: int, i: int) -> int:
+def run_candidate_multi_seed(engine, market_state, fusion_output, contract_id, base_seed=42, n_seeds=5):
     """
-    Generates a deterministic seed based on Contract ID + Index.
-    Ensures the same contract gets the same 5 seeds every time.
+    Runs Monte Carlo simulations for a single candidate across varying randomness.
+    Signature strictly enforced: engine, market_state, fusion_output
     """
-    h = zlib.crc32(contract_id.encode("utf-8")) & 0xFFFFFFFF
-    return (base_seed + h + i + 9973) % (2 ** 32)
-
-
-def aggregate_metrics(metrics_list):
-    """
-    Computes Mean and StdDev for all numeric metrics across seeds.
-    """
-    out = {}
-    for k in AGG_KEYS:
-        vals = [m.get(k) for m in metrics_list if m.get(k) is not None]
-        if not vals:
-            continue
-        arr = np.array(vals, dtype=float)
-        out[f"{k}_mean"] = float(arr.mean())
-        out[f"{k}_std"] = float(arr.std(ddof=0))
-    return out
-
-
-def run_candidate_multi_seed(mc_engine, fusion_output, market_state, contract_id, base_seed, n_seeds):
-    metrics_list = []
-    per_seed_rows = []
+    safe_id = str(contract_id) if contract_id is not None else "UNKNOWN_CONTRACT"
+    results = []
 
     for i in range(n_seeds):
-        seed = stable_seed(contract_id, base_seed, i)
-        np.random.seed(seed)
+        # FIX 3: Enforce deterministic randomness per iteration so seeds are actually different
+        current_seed = base_seed + i
+        np.random.seed(current_seed)
 
-        m = mc_engine.generate_risk_metrics(fusion_output, market_state)
+        sim_res = engine.generate_risk_metrics(
+            fusion_output=fusion_output,
+            market_state=market_state
+        )
 
-        metrics_list.append(m)
-        row = {"seed_idx": i, "seed_val": seed, **m}
-        per_seed_rows.append(row)
+        sim_res['seed_index'] = i
+        sim_res['contract_id'] = safe_id
+        results.append(sim_res)
 
-    agg = aggregate_metrics(metrics_list)
-    return per_seed_rows, agg
+    df_res = pd.DataFrame(results)
+
+    # FIX 2: Compute the full, rich suite of metrics expected by run_daily.py
+    summary = {
+        'expected_pnl_mean': df_res['expected_pnl'].mean() if 'expected_pnl' in df_res else 0.0,
+        'prob_profit_mean': df_res['prob_profit'].mean() if 'prob_profit' in df_res else 0.0,
+        'downside_sharpe_mean': df_res['downside_sharpe'].mean() if 'downside_sharpe' in df_res else 0.0,
+        'Va_R_95_mean': df_res['VaR_95'].mean() if 'VaR_95' in df_res else 0.0,
+        'mc_sharpe': df_res['mc_sharpe'].mean() if 'mc_sharpe' in df_res else 0.0,
+        'expected_option_price': df_res['expected_option_price'].mean() if 'expected_option_price' in df_res else 0.0,
+        'expected_pnl_std': df_res['expected_pnl'].std() if 'expected_pnl' in df_res else 0.0,
+        'prob_profit_std': df_res['prob_profit'].std() if 'prob_profit' in df_res else 0.0,
+        'downside_sharpe_std': df_res['downside_sharpe'].std() if 'downside_sharpe' in df_res else 0.0,
+        'VaR95_std': df_res['VaR_95'].std() if 'VaR_95' in df_res else 0.0,
+        'p10_value': df_res['p10_value'].mean() if 'p10_value' in df_res else 0.0,
+        'p90_value': df_res['p90_value'].mean() if 'p90_value' in df_res else 0.0,
+        'avg_exit_day': df_res['avg_exit_day'].mean() if 'avg_exit_day' in df_res else 0.0,
+        'TP_rate': df_res['TP_rate'].mean() if 'TP_rate' in df_res else 0.0,
+        'SL_rate': df_res['SL_rate'].mean() if 'SL_rate' in df_res else 0.0,
+        'BE_rate': df_res['BE_rate'].mean() if 'BE_rate' in df_res else 0.0,
+        'Hold_rate': df_res['Hold_rate'].mean() if 'Hold_rate' in df_res else 0.0,
+        'mae_mean': df_res['mae_mean'].mean() if 'mae_mean' in df_res else 0.0,
+        'mfe_mean': df_res['mfe_mean'].mean() if 'mfe_mean' in df_res else 0.0
+    }
+
+    return results, summary
 
 
-def ensure_ledger_schema(path, new_headers):
+def append_ledger_rows(file_path, rows, columns):
     """
-    Checks if the existing ledger header matches new_headers.
-    If not, backs up the old file to start fresh.
+    FIX 1: Signature updated to accept `columns`.
+    Appends rows directly to the CSV without loading the entire file into memory.
+    Enforces the exact schema provided in `columns`.
     """
-    if not os.path.exists(path):
-        return
+    new_df = pd.DataFrame(rows)
 
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            existing_header_str = f.readline().strip()
-            # Handle empty file case
-            if not existing_header_str:
-                existing_headers = []
-            else:
-                existing_headers = existing_header_str.split(",")
-    except Exception as e:
-        print(f"[LEDGER] Warning: Could not read existing header: {e}")
-        existing_headers = []
+    # Ensure exact column alignment to prevent schema drift
+    new_df = new_df.reindex(columns=columns)
 
-    # Compare lists (robust check)
-    if existing_headers != new_headers:
-        ts = time.strftime("%Y%m%d_%H%M%S")
-        backup_path = path.replace(".csv", f"_backup_{ts}.csv")
-        try:
-            os.rename(path, backup_path)
-            print(f"\n[LEDGER] 🚨 SCHEMA MISMATCH DETECTED 🚨")
-            print(f"Old ledger renamed to: {os.path.basename(backup_path)}")
-            print(f"Starting new clean ledger with {len(new_headers)} columns.\n")
-        except OSError as e:
-            print(f"[LEDGER] Error backing up file: {e}")
+    # Write in append mode. Write headers only if the file doesn't exist yet.
+    file_exists = os.path.exists(file_path)
+    new_df.to_csv(file_path, mode='a', index=False, header=not file_exists)
 
 
-def append_ledger_rows(csv_path, rows, headers=None):
-    """
-    Appends rows to CSV.
-    Enforces schema alignment if headers are provided.
-    """
-    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
-
-    df_new = pd.DataFrame(rows)
-
-    # Enforce column order if provided (prevents misalignment)
-    if headers:
-        df_new = df_new.reindex(columns=headers)
-
-    if os.path.exists(csv_path):
-        df_new.to_csv(csv_path, mode='a', header=False, index=False)
-    else:
-        df_new.to_csv(csv_path, mode='w', header=True, index=False)
-
-
-def make_run_id() -> str:
-    return datetime.now().strftime("%Y%m%d_%H%M%S")
+def make_run_id():
+    return str(uuid.uuid4())[:8]

@@ -17,6 +17,9 @@ class MarketState:
     K: float  # Strike
     price: float  # Current option price
     is_call: bool  # Call or Put
+    mu: float  # Expected stock drift (AI Prediction)
+    sigma: float  # Expected stock volatility (AI Prediction)
+    aiv: float  # Expected change in implied vol (AI Prediction)
 
 
 class MarketStateAdapter:
@@ -36,6 +39,12 @@ class MarketStateAdapter:
             entry_price = float(leg["entry_price"])
             dte = int(leg["dte"])
             is_call = (leg["type"].lower() == "call")
+
+            # --- THE FIX: Extract all three AI predictions ---
+            mu = float(candidate["mu"])
+            sigma = float(candidate["sigma"])
+            aiv = float(candidate["aiv"])
+
         except KeyError as e:
             raise ValueError(f"Candidate violates Canonical Schema. Missing field: {e}")
 
@@ -46,7 +55,10 @@ class MarketStateAdapter:
             r=self.r,
             K=K,
             price=entry_price,
-            is_call=is_call
+            is_call=is_call,
+            mu=mu,
+            sigma=sigma,
+            aiv=aiv
         )
         return market_state.__dict__
 
