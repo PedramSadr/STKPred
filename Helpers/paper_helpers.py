@@ -13,7 +13,7 @@ def run_candidate_multi_seed(engine, market_state, fusion_output, contract_id, b
     results = []
 
     for i in range(n_seeds):
-        # FIX 3: Enforce deterministic randomness per iteration so seeds are actually different
+        # Enforce deterministic randomness per iteration so seeds are actually different
         current_seed = base_seed + i
         np.random.seed(current_seed)
 
@@ -28,7 +28,7 @@ def run_candidate_multi_seed(engine, market_state, fusion_output, contract_id, b
 
     df_res = pd.DataFrame(results)
 
-    # FIX 2: Compute the full, rich suite of metrics expected by run_daily.py
+    # Compute the full, rich suite of metrics expected by run_daily.py
     summary = {
         'expected_pnl_mean': df_res['expected_pnl'].mean() if 'expected_pnl' in df_res else 0.0,
         'prob_profit_mean': df_res['prob_profit'].mean() if 'prob_profit' in df_res else 0.0,
@@ -56,16 +56,12 @@ def run_candidate_multi_seed(engine, market_state, fusion_output, contract_id, b
 
 def append_ledger_rows(file_path, rows, columns):
     """
-    FIX 1: Signature updated to accept `columns`.
     Appends rows directly to the CSV without loading the entire file into memory.
     Enforces the exact schema provided in `columns`.
     """
     new_df = pd.DataFrame(rows)
-
-    # Ensure exact column alignment to prevent schema drift
     new_df = new_df.reindex(columns=columns)
 
-    # Write in append mode. Write headers only if the file doesn't exist yet.
     file_exists = os.path.exists(file_path)
     new_df.to_csv(file_path, mode='a', index=False, header=not file_exists)
 
