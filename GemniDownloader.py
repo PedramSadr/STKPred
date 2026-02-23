@@ -57,6 +57,13 @@ def download_and_clean(ticker, start_date, end_date):
 def calculate_indicators(df):
     if df.empty: return df
 
+    # --- ADD THESE 4 LINES ---
+    if 'Date' in df.columns:
+        df = df.drop_duplicates(subset=['Date'], keep='last')
+        df = df.sort_values('Date')
+    df.reset_index(drop=True, inplace=True)
+    # -------------------------
+
     # Sort by date for indicators
     if 'Date' in df.columns:
         df['Date'] = pd.to_datetime(df['Date'])

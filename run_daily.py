@@ -44,6 +44,9 @@ def format_schema_row(data_dict):
     return {col: data_dict.get(col, "") for col in LEDGER_COLUMNS}
 
 
+# =========================================================
+# 1. LOAD DATA & ROBUST DATE GUARD
+# =========================================================
 catalog = pd.read_csv(CATALOG_FILE, low_memory=False)
 catalog["date"] = pd.to_datetime(catalog["date"], errors="coerce")
 catalog = catalog.dropna(subset=["date"])
@@ -67,6 +70,9 @@ if bus_lag > 2 or cal_lag > 3:
 catalog_today = catalog[catalog["date"] == TRADE_DATE].copy()
 catalog_today["row_id"] = catalog_today.index
 
+# =========================================================
+# 2. UNDERLYING PRICE INJECTION
+# =========================================================
 print(f"--- Running Daily Strategy for: {TRADE_DATE} ---")
 spot_price = np.nan
 try:
@@ -106,6 +112,9 @@ if pd.isna(spot_price) or spot_price <= 0:
 
 catalog_today["underlying_price"] = spot_price
 
+# =========================================================
+# 3. INITIALIZE CALENDARS & BUILDERS
+# =========================================================
 DAILY_RUN_ID = make_run_id()
 
 MACRO_JSON = os.path.join(CONFIG_DIR, "no_event_days.json")
@@ -134,8 +143,14 @@ except Exception as e:
     fusion_output = {"mu": 0.0, "sigma": 0.50, "aiv": 0.0, "raw_mu_10d": 0.0}
 
 mc_engine = MonteCarloEngine(num_paths=50000, exit_config=ExitRules())
-all_ledger_rows = []
 
+# Staging lists for execution
+all_ledger_rows = []
+approved_candidates_for_sorting = []
+
+# =========================================================
+# 4. EXECUTION LOOP
+# =========================================================
 for idx, candidate in enumerate(candidates, start=1):
     if candidate.get("decision", "TRADE") == "BLOCK":
         continue
@@ -261,9 +276,14 @@ for idx, candidate in enumerate(candidates, start=1):
         })
         all_ledger_rows.append(format_schema_row(agg_row))
 
+        # ---> MODIFIED: Store the successful candidates for sorting <---
         if final_decision.decision.value == "TRADE":
-            print(f"  [Candidate {idx}] {contract_id} APPROVED (Score: {final_decision.confidence_score:.2f})")
+            approved_candidates_for_sorting.append({
+                "print_string": f"  [Candidate {idx}] {contract_id} APPROVED (Score: {final_decision.confidence_score:.2f})",
+                "score": final_decision.confidence_score
+            })
         else:
+            # Print rejections immediately
             print(f"  [Candidate {idx}] {contract_id} REJECTED: {final_decision.reason}")
 
     except Exception as e:
@@ -271,6 +291,22 @@ for idx, candidate in enumerate(candidates, start=1):
         traceback.print_exc(limit=3)
         print("-" * 40)
 
+# =========================================================
+# 4.5 SORT AND DISPLAY WINNERS
+# =========================================================
+if approved_candidates_for_sorting:
+    print("\n--- FINAL APPROVED CANDIDATES (Sorted by Score) ---")
+    # Sort descending by score
+    approved_candidates_for_sorting.sort(key=lambda x: x['score'], reverse=True)
+
+    for item in approved_candidates_for_sorting:
+        print(item["print_string"])
+else:
+    print("\n--- NO CANDIDATES APPROVED ---")
+
+# =========================================================
+# 5. SAVE RESULTS
+# =========================================================
 if all_ledger_rows:
     append_ledger_rows(LEDGER_FILE, all_ledger_rows, LEDGER_COLUMNS)
     print(f"\n[SUCCESS] Appended {len(all_ledger_rows)} rows to ledger.")

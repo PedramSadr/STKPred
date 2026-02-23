@@ -1,124 +1,167 @@
-import argparse
-import logging
-from pathlib import Path
+import os
+import sys
 import pandas as pd
-import numpy as np
+import pandas_ta as ta
+import yfinance as yf
+from datetime import date, datetime, timedelta
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
-logger = logging.getLogger(__name__)
+# Configuration
+OUTPUT_FILE = r'C:\My Documents\Mics\Logs\tsla_daily.csv'
+DEFAULT_START_DATE = '2010-01-01'
 
 
-def _read_csv_safely(path: Path) -> pd.DataFrame:
-    """Read a CSV file with aggressive header cleaning."""
+def get_last_recorded_date(file_path):
+    if not os.path.exists(file_path):
+        return None
     try:
-        # FIX 1: Use 'utf-8-sig' to strip invisible BOM characters (\ufeff)
-        df = pd.read_csv(path, low_memory=False, encoding='utf-8-sig')
+        df = pd.read_csv(file_path, usecols=['Date'])
+        if df.empty: return None
+        # Ensure we parse correctly
+        return pd.to_datetime(df['Date'].max()).date()
     except Exception as e:
-        logger.warning("Failed to read %s: %s", path, e)
+        print(f"Warning: Could not read existing file: {e}")
+        return None
+
+
+def safe_strip_timezone(series):
+    """Safely removes timezones whether the series is tz-aware or tz-naive."""
+    series = pd.to_datetime(series)
+    if isinstance(series.dtype, pd.DatetimeTZDtype):
+        return series.dt.tz_convert(None)
+    return series
+
+
+def download_and_clean(ticker, start_date, end_date):
+    print(f"Fetching {ticker} data from {start_date} to {end_date}...")
+
+    # Download with auto_adjust to handle splits/dividends
+    df = yf.download(ticker, start=start_date, end=end_date, auto_adjust=True, progress=False)
+
+    if df.empty:
         return pd.DataFrame()
 
-    # Normalize Columns: Strip whitespace and lower case
-    df.columns = [str(c).strip().lower() for c in df.columns]
+    # Handle yfinance MultiIndex columns (Price, Ticker)
+    if isinstance(df.columns, pd.MultiIndex):
+        # Keep the price level, drop the ticker level
+        df.columns = df.columns.get_level_values(0)
 
-    # Drop fully empty rows
-    df.dropna(how='all', inplace=True)
+    # Reset index to make 'Date' a column
+    df = df.reset_index()
 
-    # FIX 2: Aggressive "Hard" Header Removal
-    # Instead of comparing to the column name, we look for the literal words
-    # that indicate a header row, because column names can be messed up.
-    if len(df.columns) > 0:
-        # Check specific columns if they exist, otherwise check the first column
-        target_col = df.columns[0]
-        if 'date' in df.columns:
-            target_col = 'date'
+    # Safely strip timezones
+    if 'Date' in df.columns:
+        df['Date'] = safe_strip_timezone(df['Date'])
 
-        # Identify rows where the content matches known header keywords
-        # This catches "date", "Date", "DATE", etc.
-        mask_rogue_header = df[target_col].astype(str).str.strip().str.lower().isin(
-            ['date', 'strike', 'expiration', 'symbol'])
-
-        if mask_rogue_header.any():
-            count = mask_rogue_header.sum()
-            logger.debug("🧹 Dropping %d rogue header rows from %s", count, path)
-            df = df.loc[~mask_rogue_header]
+    # Rename standard columns to Title Case
+    rename_map = {
+        'open': 'Open', 'high': 'High', 'low': 'Low',
+        'close': 'Close', 'volume': 'Volume', 'adj close': 'Close'
+    }
+    df = df.rename(columns=lambda x: rename_map.get(x.lower(), x))
 
     return df
 
 
-def append_csv_files(input_dir: str, output_file: str, pattern: str = "*.csv", dedupe: bool = True,
-                     parse_dates: bool = False, skip_first_line: bool = False) -> Path:
-    in_path = Path(input_dir)
-    if not in_path.exists() or not in_path.is_dir():
-        raise FileNotFoundError(f"Input directory does not exist: {input_dir}")
+def calculate_indicators(df):
+    if df.empty: return df
 
-    files = sorted(in_path.glob(pattern))
-    if not files:
-        raise FileNotFoundError(f"No files found in {input_dir} matching {pattern}")
+    # pandas_ta requires a continuous DatetimeIndex for VWAP and clean MACD calculation
+    if 'Date' in df.columns:
+        df['Date'] = pd.to_datetime(df['Date'])
+        df = df.drop_duplicates(subset=['Date'], keep='last')
+        df = df.sort_values('Date')
+        # Set Date as index temporarily for technical analysis math
+        df.set_index('Date', inplace=True)
 
-    logger.info("Found %d files in %s", len(files), input_dir)
+    # Indicators
+    df['RSI'] = ta.rsi(df['Close'], length=14)
+    df['SMA_25'] = ta.sma(df['Close'], length=25)
+    df['SMA_50'] = ta.sma(df['Close'], length=50)
+    df['SMA_100'] = ta.sma(df['Close'], length=100)
+    df['SMA_200'] = ta.sma(df['Close'], length=200)
+    df.ta.macd(append=True)
 
-    dfs = []
-    for idx, f in enumerate(files):
-        # We use the safe reader for EVERYTHING now.
-        # It is smarter than the 'skiprows=1' logic because it detects headers dynamically.
-        df = _read_csv_safely(f)
+    # Robust VWAP
+    if {'High', 'Low', 'Close', 'Volume'}.issubset(df.columns):
+        try:
+            df['VWAP'] = ta.vwap(high=df['High'], low=df['Low'], close=df['Close'], volume=df['Volume'])
+        except Exception as e:
+            print(f"VWAP Warning: {e}")
+            df['VWAP'] = 0.0
 
-        if df.empty:
-            continue
+    # Bring Date back as a standard column
+    df.reset_index(inplace=True)
 
-        dfs.append(df)
-
-    if not dfs:
-        raise RuntimeError("No readable CSVs found to concatenate.")
-
-    logger.info("Concatenating %d DataFrames...", len(dfs))
-    combined = pd.concat(dfs, ignore_index=True, sort=False)
-
-    # FIX 3: Final Sweep on the Combined Data
-    # Just in case a header slipped through (e.g. from an unlabelled index column)
-    if 'date' in combined.columns:
-        mask = combined['date'].astype(str).str.strip().str.lower() == 'date'
-        if mask.any():
-            logger.info("🧹 Final Sweep: Dropping %d rogue headers from combined data", mask.sum())
-            combined = combined[~mask]
-
-    # Deduplicate
-    if dedupe:
-        before = len(combined)
-        combined.drop_duplicates(inplace=True)
-        after = len(combined)
-        logger.info("Dropped %d duplicate rows", before - after)
-
-    # Type Inference
-    for col in combined.columns:
-        if col == 'date': continue
-        # Try numeric conversion
-        combined[col] = pd.to_numeric(combined[col], errors='ignore')
-
-    out_path = Path(output_file)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    combined.to_csv(out_path, index=False)
-    logger.info("✅ Success! Wrote %s (%d rows)", out_path, len(combined))
-    return out_path
-
-
-def _parse_args():
-    p = argparse.ArgumentParser(description="Append CSV files safely.")
-    p.add_argument('--input-dir', '-i', required=True, help='Directory containing CSV files')
-    p.add_argument('--output-file', '-o', required=True, help='Output CSV file path')
-    p.add_argument('--pattern', default='*.csv', help='Glob pattern')
-    p.add_argument('--no-dedupe', dest='dedupe', action='store_false')
-    p.add_argument('--parse-dates', action='store_true')
-    p.add_argument('--skip-first-line', action='store_true')
-    return p.parse_args()
+    return df
 
 
 if __name__ == '__main__':
-    args = _parse_args()
-    try:
-        append_csv_files(args.input_dir, args.output_file, pattern=args.pattern, dedupe=args.dedupe,
-                         parse_dates=args.parse_dates, skip_first_line=args.skip_first_line)
-    except Exception as e:
-        logger.exception("Failed: %s", e)
-        raise
+    # 1. Determine Start Date
+    last_date = get_last_recorded_date(OUTPUT_FILE)
+    today = date.today()
+
+    if last_date:
+        # Fetch a buffer (300 days) to ensuring moving averages (SMA200) are accurate
+        start_date = (last_date - timedelta(days=300)).isoformat()
+        print(f"Existing data found up to {last_date}. Smart-fetching from {start_date}...")
+    else:
+        start_date = DEFAULT_START_DATE
+        print("No existing data. Performing full download...")
+
+    end_date = today.isoformat()
+
+    # 2. Download TSLA
+    tsla_df = download_and_clean('TSLA', start_date, end_date)
+
+    # 3. Download Market Data
+    market_tickers = ['^VIX', 'DX-Y.NYB', 'SPY', 'CL=F']
+    print("Fetching Market Data...")
+    market_df = yf.download(market_tickers, start=start_date, end=end_date, auto_adjust=True, progress=False)
+
+    # Clean Market Data Structure
+    if isinstance(market_df.columns, pd.MultiIndex):
+        # Extract just the 'Close' prices
+        try:
+            market_df = market_df['Close']
+        except KeyError:
+            pass  # Fallback if structure differs
+
+    market_df = market_df.reset_index()
+
+    # Safely strip Timezones from Market Data too
+    if 'Date' in market_df.columns:
+        market_df['Date'] = safe_strip_timezone(market_df['Date'])
+
+    market_df = market_df.rename(columns={'^VIX': 'VIX', 'DX-Y.NYB': 'DXY', 'SPY': 'SPY', 'CL=F': 'WTI'})
+
+    # 4. Merge TSLA + Market
+    if 'Date' in tsla_df.columns and 'Date' in market_df.columns:
+        merged_new = pd.merge(tsla_df, market_df, on='Date', how='left')
+    else:
+        merged_new = tsla_df
+
+    # 5. Combine with Historical CSV
+    if last_date and os.path.exists(OUTPUT_FILE):
+        existing_df = pd.read_csv(OUTPUT_FILE)
+        existing_df['Date'] = pd.to_datetime(existing_df['Date'])
+
+        full_df = pd.concat([existing_df, merged_new])
+        # Drop duplicates based on Date (now safe because timezones are gone)
+        full_df = full_df.drop_duplicates(subset=['Date'], keep='last')
+    else:
+        full_df = merged_new
+
+    # 6. Save
+    final_df = calculate_indicators(full_df)
+    final_df = final_df.dropna(subset=['Date']).sort_values('Date')
+
+    # Define Column Order
+    macd_cols = [c for c in final_df.columns if c.startswith('MACD_')]
+    base_cols = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'RSI', 'VWAP',
+                 'SMA_25', 'SMA_50', 'SMA_100', 'SMA_200', 'WTI', 'VIX', 'DXY', 'SPY']
+
+    cols_to_save = [c for c in base_cols + macd_cols if c in final_df.columns]
+
+    final_df[cols_to_save].to_csv(OUTPUT_FILE, index=False)
+    print(f"Successfully updated {OUTPUT_FILE}")
+    print(f"Newest Record: {final_df['Date'].max().date()}")
