@@ -88,11 +88,10 @@ if __name__ == "__main__":
     # 2. Download Option Chains (AlphaVantage)
     if not run_step("AlphavantageDownloader.py", "2. Download Option Chains"): sys.exit(1)
 
-    # 3. Consolidate Chains (FileAppender)
     # FIX: Output to the RAW COMBINED file, not the final catalog
     appender_args = [
-        "--input-dir", SOURCE_DATA_DIR,
-        "--output-file", RAW_COMBINED_FILE,
+        "--input_dir", SOURCE_DATA_DIR,  # <--- Changed hyphen to underscore
+        "--output_file", RAW_COMBINED_FILE,  # <--- Changed hyphen to underscore
         "--pattern", "*.csv"
     ]
     if not run_step("FileAppender.py", "3. Append to History", args=appender_args): sys.exit(1)

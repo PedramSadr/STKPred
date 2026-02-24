@@ -1,167 +1,72 @@
 import os
-import sys
+import glob
+import argparse
 import pandas as pd
-import pandas_ta as ta
-import yfinance as yf
-from datetime import date, datetime, timedelta
+import logging
 
-# Configuration
-OUTPUT_FILE = r'C:\My Documents\Mics\Logs\tsla_daily.csv'
-DEFAULT_START_DATE = '2010-01-01'
+# Setup standard logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
 
 
-def get_last_recorded_date(file_path):
-    if not os.path.exists(file_path):
-        return None
-    try:
-        df = pd.read_csv(file_path, usecols=['Date'])
-        if df.empty: return None
-        # Ensure we parse correctly
-        return pd.to_datetime(df['Date'].max()).date()
-    except Exception as e:
-        print(f"Warning: Could not read existing file: {e}")
-        return None
+def append_csv_files(input_dir, output_file, pattern="*.csv", dedupe=True, parse_dates=False, skip_first_line=False):
+    search_pattern = os.path.join(input_dir, pattern)
+    file_list = glob.glob(search_pattern)
 
+    if not file_list:
+        logging.warning(f"No files found matching {search_pattern}")
+        return
 
-def safe_strip_timezone(series):
-    """Safely removes timezones whether the series is tz-aware or tz-naive."""
-    series = pd.to_datetime(series)
-    if isinstance(series.dtype, pd.DatetimeTZDtype):
-        return series.dt.tz_convert(None)
-    return series
+    logging.info(f"Found {len(file_list)} files in {input_dir}")
 
-
-def download_and_clean(ticker, start_date, end_date):
-    print(f"Fetching {ticker} data from {start_date} to {end_date}...")
-
-    # Download with auto_adjust to handle splits/dividends
-    df = yf.download(ticker, start=start_date, end=end_date, auto_adjust=True, progress=False)
-
-    if df.empty:
-        return pd.DataFrame()
-
-    # Handle yfinance MultiIndex columns (Price, Ticker)
-    if isinstance(df.columns, pd.MultiIndex):
-        # Keep the price level, drop the ticker level
-        df.columns = df.columns.get_level_values(0)
-
-    # Reset index to make 'Date' a column
-    df = df.reset_index()
-
-    # Safely strip timezones
-    if 'Date' in df.columns:
-        df['Date'] = safe_strip_timezone(df['Date'])
-
-    # Rename standard columns to Title Case
-    rename_map = {
-        'open': 'Open', 'high': 'High', 'low': 'Low',
-        'close': 'Close', 'volume': 'Volume', 'adj close': 'Close'
-    }
-    df = df.rename(columns=lambda x: rename_map.get(x.lower(), x))
-
-    return df
-
-
-def calculate_indicators(df):
-    if df.empty: return df
-
-    # pandas_ta requires a continuous DatetimeIndex for VWAP and clean MACD calculation
-    if 'Date' in df.columns:
-        df['Date'] = pd.to_datetime(df['Date'])
-        df = df.drop_duplicates(subset=['Date'], keep='last')
-        df = df.sort_values('Date')
-        # Set Date as index temporarily for technical analysis math
-        df.set_index('Date', inplace=True)
-
-    # Indicators
-    df['RSI'] = ta.rsi(df['Close'], length=14)
-    df['SMA_25'] = ta.sma(df['Close'], length=25)
-    df['SMA_50'] = ta.sma(df['Close'], length=50)
-    df['SMA_100'] = ta.sma(df['Close'], length=100)
-    df['SMA_200'] = ta.sma(df['Close'], length=200)
-    df.ta.macd(append=True)
-
-    # Robust VWAP
-    if {'High', 'Low', 'Close', 'Volume'}.issubset(df.columns):
+    dfs = []
+    for f in file_list:
         try:
-            df['VWAP'] = ta.vwap(high=df['High'], low=df['Low'], close=df['Close'], volume=df['Volume'])
+            df = pd.read_csv(f, low_memory=False)
+            dfs.append(df)
         except Exception as e:
-            print(f"VWAP Warning: {e}")
-            df['VWAP'] = 0.0
+            logging.error(f"Error reading {f}: {e}")
 
-    # Bring Date back as a standard column
-    df.reset_index(inplace=True)
+    if not dfs:
+        logging.error("No valid dataframes to concatenate.")
+        return
 
-    return df
+    logging.info(f"Concatenating {len(dfs)} DataFrames...")
+    combined = pd.concat(dfs, ignore_index=True)
+
+    if dedupe:
+        initial_len = len(combined)
+        combined = combined.drop_duplicates()
+        logging.info(f"Dropped {initial_len - len(combined)} duplicate rows")
+
+    # Safely convert columns to numeric (using errors='coerce' to prevent crashes)
+    for col in combined.columns:
+        if combined[col].dtype == 'object':
+            try:
+                combined[col] = pd.to_numeric(combined[col], errors='coerce')
+            except Exception:
+                pass
+
+    logging.info(f"✅ Success! Wrote {output_file} ({len(combined)} rows)")
+    combined.to_csv(output_file, index=False)
 
 
 if __name__ == '__main__':
-    # 1. Determine Start Date
-    last_date = get_last_recorded_date(OUTPUT_FILE)
-    today = date.today()
+    parser = argparse.ArgumentParser(description="Append and merge historical CSV files.")
+    parser.add_argument("--input_dir", required=True, help="Directory containing the daily CSV files")
+    parser.add_argument("--output_file", required=True, help="Path to save the combined master CSV")
+    parser.add_argument("--pattern", default="*.csv", help="File matching pattern")
+    parser.add_argument("--dedupe", action="store_true", default=True,
+                        help="Deduplicate rows across the combined dataset")
+    parser.add_argument("--parse_dates", action="store_true", default=False)
+    parser.add_argument("--skip_first_line", action="store_true", default=False)
 
-    if last_date:
-        # Fetch a buffer (300 days) to ensuring moving averages (SMA200) are accurate
-        start_date = (last_date - timedelta(days=300)).isoformat()
-        print(f"Existing data found up to {last_date}. Smart-fetching from {start_date}...")
-    else:
-        start_date = DEFAULT_START_DATE
-        print("No existing data. Performing full download...")
+    args = parser.parse_args()
 
-    end_date = today.isoformat()
-
-    # 2. Download TSLA
-    tsla_df = download_and_clean('TSLA', start_date, end_date)
-
-    # 3. Download Market Data
-    market_tickers = ['^VIX', 'DX-Y.NYB', 'SPY', 'CL=F']
-    print("Fetching Market Data...")
-    market_df = yf.download(market_tickers, start=start_date, end=end_date, auto_adjust=True, progress=False)
-
-    # Clean Market Data Structure
-    if isinstance(market_df.columns, pd.MultiIndex):
-        # Extract just the 'Close' prices
-        try:
-            market_df = market_df['Close']
-        except KeyError:
-            pass  # Fallback if structure differs
-
-    market_df = market_df.reset_index()
-
-    # Safely strip Timezones from Market Data too
-    if 'Date' in market_df.columns:
-        market_df['Date'] = safe_strip_timezone(market_df['Date'])
-
-    market_df = market_df.rename(columns={'^VIX': 'VIX', 'DX-Y.NYB': 'DXY', 'SPY': 'SPY', 'CL=F': 'WTI'})
-
-    # 4. Merge TSLA + Market
-    if 'Date' in tsla_df.columns and 'Date' in market_df.columns:
-        merged_new = pd.merge(tsla_df, market_df, on='Date', how='left')
-    else:
-        merged_new = tsla_df
-
-    # 5. Combine with Historical CSV
-    if last_date and os.path.exists(OUTPUT_FILE):
-        existing_df = pd.read_csv(OUTPUT_FILE)
-        existing_df['Date'] = pd.to_datetime(existing_df['Date'])
-
-        full_df = pd.concat([existing_df, merged_new])
-        # Drop duplicates based on Date (now safe because timezones are gone)
-        full_df = full_df.drop_duplicates(subset=['Date'], keep='last')
-    else:
-        full_df = merged_new
-
-    # 6. Save
-    final_df = calculate_indicators(full_df)
-    final_df = final_df.dropna(subset=['Date']).sort_values('Date')
-
-    # Define Column Order
-    macd_cols = [c for c in final_df.columns if c.startswith('MACD_')]
-    base_cols = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'RSI', 'VWAP',
-                 'SMA_25', 'SMA_50', 'SMA_100', 'SMA_200', 'WTI', 'VIX', 'DXY', 'SPY']
-
-    cols_to_save = [c for c in base_cols + macd_cols if c in final_df.columns]
-
-    final_df[cols_to_save].to_csv(OUTPUT_FILE, index=False)
-    print(f"Successfully updated {OUTPUT_FILE}")
-    print(f"Newest Record: {final_df['Date'].max().date()}")
+    append_csv_files(
+        args.input_dir,
+        args.output_file,
+        pattern=args.pattern,
+        dedupe=args.dedupe,
+        parse_dates=args.parse_dates,
+        skip_first_line=args.skip_first_line
+    )
