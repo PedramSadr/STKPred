@@ -38,9 +38,11 @@ def append_csv_files(input_dir, output_file, pattern="*.csv", dedupe=True, parse
         combined = combined.drop_duplicates()
         logging.info(f"Dropped {initial_len - len(combined)} duplicate rows")
 
-    # Safely convert columns to numeric (using errors='coerce' to prevent crashes)
+    # THE FIX: Safely convert to numeric, but EXPLICITLY PROTECT strings and dates
+    protected_strings = ['date', 'expiration', 'type', 'symbol', 'contractid', 'contract_id']
+
     for col in combined.columns:
-        if combined[col].dtype == 'object':
+        if combined[col].dtype == 'object' and str(col).lower().strip() not in protected_strings:
             try:
                 combined[col] = pd.to_numeric(combined[col], errors='coerce')
             except Exception:

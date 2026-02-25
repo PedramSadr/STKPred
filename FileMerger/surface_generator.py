@@ -13,11 +13,9 @@ def interpolate_linear(curve_df: pd.DataFrame, target_dte: int, col: str) -> flo
     curve_df = curve_df.dropna(subset=["dte", col]).sort_values("dte")
     if curve_df.empty: return 0.0
 
-    # Exact match
     exact = curve_df[curve_df["dte"] == target_dte]
     if not exact.empty: return float(exact.iloc[0][col])
 
-    # Bracket
     near = curve_df[curve_df["dte"] < target_dte]
     far = curve_df[curve_df["dte"] > target_dte]
 
@@ -35,7 +33,12 @@ def interpolate_linear(curve_df: pd.DataFrame, target_dte: int, col: str) -> flo
 
 
 def _ensure_datetime(df: pd.DataFrame, col: str) -> None:
-    if col in df.columns: df[col] = pd.to_datetime(df[col], errors="coerce")
+    """Safely converts to datetime, strips timezones, and normalizes to midnight."""
+    if col in df.columns:
+        s = pd.to_datetime(df[col], errors="coerce")
+        if isinstance(s.dtype, pd.DatetimeTZDtype):
+            s = s.dt.tz_convert(None)
+        df[col] = s.dt.normalize()
 
 
 def build_surface_vectors(daily_path: str, options_path: str, surf_out_path: str, menu_out_path: str) -> None:
@@ -63,22 +66,24 @@ def build_surface_vectors(daily_path: str, options_path: str, surf_out_path: str
     df_daily = df_daily.dropna(subset=["date"]).sort_values("date")
     df_opts = df_opts.dropna(subset=["date", "expiration"]).sort_values("date")
 
-    # 2. MAP CONTEXT
+    # 2. MAP CONTEXT (Using Foolproof String Mapping)
     print("2. Mapping Context...")
     if "close" not in df_daily.columns: raise ValueError("Daily file needs 'close'")
 
-    df_daily = df_daily.set_index("date")
+    df_daily['date_str'] = df_daily['date'].dt.strftime('%Y-%m-%d')
+    df_opts['date_str'] = df_opts['date'].dt.strftime('%Y-%m-%d')
 
-    # Create Maps
-    price_map = df_daily["close"].to_dict()
-    vix_map = df_daily["vix"].to_dict() if "vix" in df_daily.columns else {}
-    spy_map = df_daily["spy"].to_dict() if "spy" in df_daily.columns else {}
-    dxy_map = df_daily["dxy"].to_dict() if "dxy" in df_daily.columns else {}
-    wti_map = df_daily["wti"].to_dict() if "wti" in df_daily.columns else {}
+    price_map = df_daily.set_index('date_str')["close"].to_dict()
+    vix_map = df_daily.set_index('date_str')["vix"].to_dict() if "vix" in df_daily.columns else {}
+    spy_map = df_daily.set_index('date_str')["spy"].to_dict() if "spy" in df_daily.columns else {}
+    dxy_map = df_daily.set_index('date_str')["dxy"].to_dict() if "dxy" in df_daily.columns else {}
+    wti_map = df_daily.set_index('date_str')["wti"].to_dict() if "wti" in df_daily.columns else {}
 
-    # Map Underlying
-    df_opts["underlying_price"] = df_opts["date"].map(price_map)
+    initial_rows = len(df_opts)
+    df_opts["underlying_price"] = df_opts["date_str"].map(price_map)
     df_opts = df_opts.dropna(subset=["underlying_price"])
+    print(f"   -> Mapped Underlying Price. Retained {len(df_opts)} of {initial_rows} option contracts.")
+
     df_opts["dte"] = (df_opts["expiration"] - df_opts["date"]).dt.days
     df_opts = df_opts[df_opts["dte"] >= 0]
 
@@ -87,26 +92,19 @@ def build_surface_vectors(daily_path: str, options_path: str, surf_out_path: str
     else:
         df_opts["type"] = df_opts["type"].astype(str).str.strip().str.lower()
 
-    # FIX A: Do NOT zero-fill IV. Handle it separately.
     for c in ["delta", "gamma", "vega", "open_interest"]:
         if c not in df_opts.columns: df_opts[c] = 0.0
         df_opts[c] = pd.to_numeric(df_opts[c], errors="coerce").fillna(0.0)
 
-    # IV Handling: preserve NaN if missing/invalid
     if "implied_volatility" in df_opts.columns:
         df_opts["implied_volatility"] = pd.to_numeric(df_opts["implied_volatility"], errors="coerce")
     else:
         df_opts["implied_volatility"] = np.nan
 
-    # =========================================================
     # 3. GENERATE MENU
-    # =========================================================
     print(f"3. Generating Options Menu -> {menu_out_path}")
-
-    # Calculate Moneyness
     df_opts['moneyness'] = df_opts['strike'] / df_opts['underlying_price']
 
-    # FIX: IMPROVED PRICING LOGIC (Mark > Mid > Last)
     if 'mark' in df_opts.columns:
         df_opts['opt_price'] = df_opts['mark']
     elif 'bid' in df_opts.columns and 'ask' in df_opts.columns:
@@ -116,28 +114,23 @@ def build_surface_vectors(daily_path: str, options_path: str, surf_out_path: str
     else:
         df_opts['opt_price'] = np.nan
 
-    # FIX B: Add 'implied_volatility' to export columns
     contract_cols = [
         'date', 'expiration', 'dte', 'type', 'strike', 'moneyness', 'opt_price',
         'bid', 'ask', 'volume', 'open_interest',
-        'implied_volatility',  # <--- Export IV
+        'implied_volatility',
         'delta', 'gamma', 'vega', 'underlying_price'
     ]
     final_cols = [c for c in contract_cols if c in df_opts.columns]
-
-    # Save the Menu
     df_opts[final_cols].to_csv(menu_out_path, index=False)
 
-    # =========================================================
-    # 4. CALCULATE PHYSICS (GEX/DEX/VEX)
-    # =========================================================
+    # 4. CALCULATE PHYSICS
     print("4. Calculating Physics for Surface...")
     df_opts["dex"] = df_opts["delta"] * df_opts["open_interest"] * CONTRACT_MULTIPLIER * df_opts["underlying_price"]
     df_opts["vex"] = df_opts["vega"] * df_opts["open_interest"] * CONTRACT_MULTIPLIER
     df_opts["gex"] = df_opts["gamma"] * df_opts["open_interest"] * CONTRACT_MULTIPLIER * (
                 df_opts["underlying_price"] ** 2)
 
-    # 5. AGGREGATE (DuckDB)
+    # 5. AGGREGATE
     print("5. Aggregating Surface...")
     con = duckdb.connect()
     con.register('df_opts', df_opts)
@@ -168,39 +161,44 @@ def build_surface_vectors(daily_path: str, options_path: str, surf_out_path: str
     surface_rows = []
 
     for day, day_curve in df_curve.groupby("date"):
+        day_str = day.strftime('%Y-%m-%d')
         vec = {"trade_date": day}
 
-        # --- PHYSICS ---
         vec["net_gamma_exposure"] = float(day_curve["total_gex"].max())
         vec["net_delta_exposure"] = float(day_curve["total_dex"].max())
         vec["net_vega_exposure"] = float(day_curve["total_vex"].max())
 
-        # --- SURFACE ---
         vec["atm_iv_14d"] = interpolate_linear(day_curve, 14, "atm_iv")
         vec["skew_25d_14d"] = interpolate_linear(day_curve, 14, "skew_25d")
 
-        # --- TERM STRUCTURE ---
         iv30 = interpolate_linear(day_curve, 30, "atm_iv")
         iv90 = interpolate_linear(day_curve, 90, "atm_iv")
         vec["term_structure_30_90"] = iv30 - iv90
 
-        # --- MACRO ---
-        vix_val = vix_map.get(day, np.nan)
-        spy_val = spy_map.get(day, np.nan)
-        tsla_val = price_map.get(day, np.nan)
+        vix_val = vix_map.get(day_str, np.nan)
+        spy_val = spy_map.get(day_str, np.nan)
+        tsla_val = price_map.get(day_str, np.nan)
 
         vec["vol_spread"] = (vec["atm_iv_14d"] - (vix_val / 100.0)) if pd.notna(vix_val) and vec[
             "atm_iv_14d"] > 0 else 0.0
-
         vec["spy_close"] = spy_val if pd.notna(spy_val) else 0.0
-        vec["dxy_close"] = dxy_map.get(day, 0.0)
-        vec["wti_close"] = wti_map.get(day, 0.0)
+        vec["dxy_close"] = dxy_map.get(day_str, 0.0)
+        vec["wti_close"] = wti_map.get(day_str, 0.0)
         vec["tsla_spy_ratio"] = (tsla_val / spy_val) if (pd.notna(spy_val) and spy_val > 0) else 0.0
 
         surface_rows.append(vec)
 
-    df_out = pd.DataFrame(surface_rows).sort_values("trade_date").fillna(0.0)
-    df_out['iv_change_1d'] = df_out['atm_iv_14d'].diff().fillna(0)
+    df_out = pd.DataFrame(surface_rows)
+
+    if not df_out.empty and "trade_date" in df_out.columns:
+        df_out = df_out.sort_values("trade_date").fillna(0.0)
+        if "atm_iv_14d" in df_out.columns:
+            df_out['iv_change_1d'] = df_out['atm_iv_14d'].diff().fillna(0.0)
+        else:
+            df_out['iv_change_1d'] = 0.0
+    else:
+        df_out = df_out.fillna(0.0)
+        df_out['iv_change_1d'] = 0.0
 
     df_out.to_csv(surf_out_path, index=False)
     print(f"SUCCESS. Saved Surface to: {surf_out_path}")
