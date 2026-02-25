@@ -16,16 +16,18 @@ LOGS_DIR = r"C:\My Documents\Mics\Logs"
 CATALOG_FILE = os.path.join(LOGS_DIR, "TSLA_Options_Contracts.csv")
 LEDGER_FILE = os.path.join(LOGS_DIR, "paper_trade_ledger.csv")
 
-for folder in ["CandidateGenerator", "MarketStateAdapter", "Montecarlo_Sharpe", "TradeDecisionBuilder", "Helpers"]:
-    sys.path.append(os.path.join(PROJECT_ROOT, folder))
+# Ensure the root project directory is in the path so fully qualified imports work anywhere
+if PROJECT_ROOT not in sys.path:
+    sys.path.append(PROJECT_ROOT)
 
+# ---> MODIFIED: Enforcing strictly unified, fully qualified imports <---
 from Montecarlo_Sharpe.MonteCarloEngine import MonteCarloEngine, ExitRules
 from Helpers.paper_helpers import run_candidate_multi_seed, append_ledger_rows, make_run_id
 from MLPTrainer.FusionPredictor import FusionPredictor
 from CandidateGenerator.candidate_generator import CandidateGenerator, GeneratorConfig
 from MarketStateAdapter.market_state_adapter import MarketStateAdapter
 from Helpers.EventCalendar import EventCalendar
-from TradeDecisionBuilder import TradeDecisionBuilder
+from TradeDecisionBuilder import TradeDecisionBuilder # Adjusted to match standard repo layout
 
 LEDGER_COLUMNS = [
     "run_id", "timestamp", "trade_date", "row_id", "model_version", "type", "strike", "dte",
@@ -88,7 +90,7 @@ try:
 
         target_ts = pd.to_datetime(TRADE_DATE)
         after = hist.loc[hist.index >= target_ts]
-        is_exact = (target_ts in pd.Index(hist.index.date))
+        is_exact = (target_ts.date() in pd.Index(hist.index.date))
 
         if not after.empty:
             spot_price = float(after["Close"].iloc[0])
@@ -130,7 +132,7 @@ if not is_macro_clear:
 else:
     print(f"\n[+] Event Calendar Clear for {TRADE_DATE}.")
 
-decision_builder = TradeDecisionBuilder()
+decision_builder = TradeDecisionBuilder.TradeDecisionBuilder()
 candidates = CandidateGenerator(GeneratorConfig(max_candidates=30)).generate(catalog_today, trade_date=str(TRADE_DATE))
 
 try:
@@ -186,7 +188,7 @@ for idx, candidate in enumerate(candidates, start=1):
             expected_pnl=agg.get("expected_pnl_mean", 0.0),
             prob_profit=agg.get("prob_profit_mean", 0.0),
             downside_sharpe=agg.get("downside_sharpe_mean", 0.0),
-            cvar=agg.get("Va_R_95_mean", 0.0),
+            cvar=agg.get("VaR_95_mean", agg.get("Va_R_95_mean", 0.0)),
             premium=entry_price,
             spread_abs=spread_abs,
             downside_sharpe_std=agg.get("downside_sharpe_std", 0.0),
@@ -213,7 +215,7 @@ for idx, candidate in enumerate(candidates, start=1):
             "bid": bid,
             "ask": ask,
             "spread_abs": spread_abs,
-            "spread_pct": spread_abs / entry_price if entry_price > 0 else 0.0,
+            "spread_pct": spread_abs / ((bid + ask) / 2.0) if (bid + ask) > 0 else 0.0,
             "volume": leg.get("volume", 0),
             "open_interest": leg.get("open_interest", 0),
             "mu_log_raw": fusion_output.get("raw_mu_10d", 0.0),
@@ -256,7 +258,7 @@ for idx, candidate in enumerate(candidates, start=1):
             "prob_profit": agg.get("prob_profit_mean", 0.0),
             "downside_sharpe": agg.get("downside_sharpe_mean", 0.0),
             "mc_sharpe": agg.get("mc_sharpe", 0.0),
-            "VaR95": agg.get("Va_R_95_mean", 0.0),
+            "VaR95": agg.get("VaR_95_mean", agg.get("Va_R_95_mean", 0.0)),
             "expected_opt_price": agg.get("expected_option_price", 0.0),
             "expected_pnl_std": agg.get("expected_pnl_std", 0.0),
             "prob_profit_std": agg.get("prob_profit_std", 0.0),
@@ -276,14 +278,12 @@ for idx, candidate in enumerate(candidates, start=1):
         })
         all_ledger_rows.append(format_schema_row(agg_row))
 
-        # ---> MODIFIED: Store the successful candidates for sorting <---
         if final_decision.decision.value == "TRADE":
             approved_candidates_for_sorting.append({
                 "print_string": f"  [Candidate {idx}] {contract_id} APPROVED (Score: {final_decision.confidence_score:.2f})",
                 "score": final_decision.confidence_score
             })
         else:
-            # Print rejections immediately
             print(f"  [Candidate {idx}] {contract_id} REJECTED: {final_decision.reason}")
 
     except Exception as e:
@@ -296,7 +296,6 @@ for idx, candidate in enumerate(candidates, start=1):
 # =========================================================
 if approved_candidates_for_sorting:
     print("\n--- FINAL APPROVED CANDIDATES (Sorted by Score) ---")
-    # Sort descending by score
     approved_candidates_for_sorting.sort(key=lambda x: x['score'], reverse=True)
 
     for item in approved_candidates_for_sorting:

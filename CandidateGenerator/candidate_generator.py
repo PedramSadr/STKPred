@@ -158,16 +158,22 @@ class CandidateGenerator:
         is_call = df["type"] == "call"
         intrinsic = np.where(is_call, np.maximum(spot - K, 0), np.maximum(K - spot, 0))
         upper = np.where(is_call, spot, K)
-        arb_fail = (df["ask"] < 0.95 * intrinsic) | (df["ask"] > 1.05 * upper)
+
+        # ---> MODIFIED: Soft no-arbitrage sanity checks to avoid false rejects on wide/fast markets <---
+        arb_fail = (df["ask"] < (intrinsic - 0.01)) | (df["ask"] > (upper + np.maximum(0.50, 0.10 * upper)))
+
         df.loc[arb_fail & (df["decision"] == "TRADE"), "decision"] = "BLOCK"
         df.loc[arb_fail & (df["block_reason"] == "OK"), "block_reason"] = "G4_Arb_Bounds_Failed"
 
         mid = (df["bid"] + df["ask"]) / 2.0
         spread_abs = df["ask"] - df["bid"]
         spread_pct = np.where(mid > 0, spread_abs / mid, 1.0)
-        cond_t1_fail = (mid < 0.50) & (spread_abs > 0.02)
-        cond_t2_fail = (mid >= 0.50) & (mid < 1.00) & ((spread_abs > 0.05) | (spread_pct > 0.15))
-        cond_t3_fail = (mid >= 1.00) & ((spread_pct > 0.03) | (spread_abs > np.maximum(0.10, 0.02 * mid)))
+
+        # ---> MODIFIED: Looser liquidity and quote-quality filters for reasonable candidates in volatile names <---
+        cond_t1_fail = (mid < 0.50) & (spread_abs > 0.05)
+        cond_t2_fail = (mid >= 0.50) & (mid < 1.00) & ((spread_abs > 0.10) | (spread_pct > 0.30))
+        cond_t3_fail = (mid >= 1.00) & ((spread_pct > 0.08) | (spread_abs > np.maximum(0.25, 0.05 * mid)))
+
         reject_mask = cond_t1_fail | cond_t2_fail | cond_t3_fail
         reasons = np.select([cond_t1_fail, cond_t2_fail, cond_t3_fail],
                             ["G5_T1_CHEAP", "G5_T2_NORMAL", "G5_T3_EXPENSIVE"], default="OK")

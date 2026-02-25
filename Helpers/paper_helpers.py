@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 import os
+import random
 import uuid
 
 
@@ -16,6 +17,7 @@ def run_candidate_multi_seed(engine, market_state, fusion_output, contract_id, b
         # Enforce deterministic randomness per iteration so seeds are actually different
         current_seed = base_seed + i
         np.random.seed(current_seed)
+        random.seed(current_seed)
 
         sim_res = engine.generate_risk_metrics(
             fusion_output=fusion_output,
@@ -33,6 +35,7 @@ def run_candidate_multi_seed(engine, market_state, fusion_output, contract_id, b
         'expected_pnl_mean': df_res['expected_pnl'].mean() if 'expected_pnl' in df_res else 0.0,
         'prob_profit_mean': df_res['prob_profit'].mean() if 'prob_profit' in df_res else 0.0,
         'downside_sharpe_mean': df_res['downside_sharpe'].mean() if 'downside_sharpe' in df_res else 0.0,
+        'VaR_95_mean': df_res['VaR_95'].mean() if 'VaR_95' in df_res else 0.0,
         'Va_R_95_mean': df_res['VaR_95'].mean() if 'VaR_95' in df_res else 0.0,
         'mc_sharpe': df_res['mc_sharpe'].mean() if 'mc_sharpe' in df_res else 0.0,
         'expected_option_price': df_res['expected_option_price'].mean() if 'expected_option_price' in df_res else 0.0,

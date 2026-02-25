@@ -43,7 +43,7 @@ class EventCalendar:
                 if t_date == ev_date:
                     reasons.append(f"Macro Block (D0): {ev['event_name']}")
             else:
-                d_minus_1 = np.busday_offset(ev_date, -1, roll='forward', holidays=self.market_holidays)
+                d_minus_1 = np.busday_offset(ev_date, -1, roll='preceding', holidays=self.market_holidays)
                 if t_date == ev_date:
                     reasons.append(f"Macro Block (D0): {ev['event_name']}")
                 elif t_date == d_minus_1:
@@ -65,7 +65,7 @@ class EventCalendar:
                 conf_date_str = er.get('confirmed_date', '')
                 if conf_date_str:
                     conf_date = np.datetime64(conf_date_str, 'D')
-                    d_minus_1 = np.busday_offset(conf_date, -1, roll='forward', holidays=self.market_holidays)
+                    d_minus_1 = np.busday_offset(conf_date, -1, roll='preceding', holidays=self.market_holidays)
                     d_plus_1 = np.busday_offset(conf_date, 1, roll='forward', holidays=self.market_holidays)
 
                     if d_minus_1 <= t_date <= d_plus_1:

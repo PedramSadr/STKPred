@@ -39,7 +39,7 @@ def append_csv_files(input_dir, output_file, pattern="*.csv", dedupe=True, parse
         logging.info(f"Dropped {initial_len - len(combined)} duplicate rows")
 
     # THE FIX: Safely convert to numeric, but EXPLICITLY PROTECT strings and dates
-    protected_strings = ['date', 'expiration', 'type', 'symbol', 'contractid', 'contract_id']
+    protected_strings = ['date', 'expiration', 'type', 'symbol', 'contractid', 'contract_id', 'run_id', 'timestamp', 'row_id', 'model_version', 'block_reason', 'decision', 'mc_mode']
 
     for col in combined.columns:
         if combined[col].dtype == 'object' and str(col).lower().strip() not in protected_strings:
@@ -57,8 +57,8 @@ if __name__ == '__main__':
     parser.add_argument("--input_dir", required=True, help="Directory containing the daily CSV files")
     parser.add_argument("--output_file", required=True, help="Path to save the combined master CSV")
     parser.add_argument("--pattern", default="*.csv", help="File matching pattern")
-    parser.add_argument("--dedupe", action="store_true", default=True,
-                        help="Deduplicate rows across the combined dataset")
+    parser.add_argument("--dedupe", action=argparse.BooleanOptionalAction, default=True,
+                        help="Deduplicate rows across the combined dataset (use --no-dedupe to disable)")
     parser.add_argument("--parse_dates", action="store_true", default=False)
     parser.add_argument("--skip_first_line", action="store_true", default=False)
 

@@ -128,7 +128,7 @@ def build_surface_vectors(daily_path: str, options_path: str, surf_out_path: str
     df_opts["dex"] = df_opts["delta"] * df_opts["open_interest"] * CONTRACT_MULTIPLIER * df_opts["underlying_price"]
     df_opts["vex"] = df_opts["vega"] * df_opts["open_interest"] * CONTRACT_MULTIPLIER
     df_opts["gex"] = df_opts["gamma"] * df_opts["open_interest"] * CONTRACT_MULTIPLIER * (
-                df_opts["underlying_price"] ** 2)
+            df_opts["underlying_price"] ** 2)
 
     # 5. AGGREGATE
     print("5. Aggregating Surface...")
@@ -154,7 +154,10 @@ def build_surface_vectors(daily_path: str, options_path: str, surf_out_path: str
     FROM curves c LEFT JOIN totals t ON c.date = t.date
     """
     df_curve = con.query(query).to_df()
-    df_curve["date"] = pd.to_datetime(df_curve["date"], errors="coerce").dropna()
+
+    # ---> MODIFIED: Strictly separated conversion and dropping to prevent misalignment <---
+    df_curve["date"] = pd.to_datetime(df_curve["date"], errors="coerce")
+    df_curve = df_curve.dropna(subset=["date"])
 
     # 6. INTERPOLATE FINAL VECTORS
     print("6. Generating Final Surface Dataset...")
