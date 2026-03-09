@@ -6,7 +6,7 @@ import pandas_ta as ta
 import yfinance as yf
 from datetime import date, datetime, timedelta
 
-# Configuration - UPDATED PATH
+# Configuration - Updated Path for TFT
 OUTPUT_FILE = r'C:\My Documents\Mics\Logs\tft\stock_daily.csv'
 DEFAULT_START_DATE = '2010-01-01'
 
@@ -91,11 +91,15 @@ def calculate_indicators(df):
     df['NATR_14_CHG_1D'] = df['NATR_14'].diff()
     df['NATR_14_Z60'] = calculate_zscore(df['NATR_14'], 60)
 
-    # 4. Realized Volatility (Annualized) - Using cleaner .diff()
+    # 4. Realized Volatility (Annualized)
     tsla_log_ret = np.log(df['Close']).diff()
     df['RV_10D'] = tsla_log_ret.rolling(10).std() * np.sqrt(252)
     df['RV_20D'] = tsla_log_ret.rolling(20).std() * np.sqrt(252)
     df['RV_60D'] = tsla_log_ret.rolling(60).std() * np.sqrt(252)
+
+    # ---> NEW: Realized Volatility Momentum (Regime Sensor) <---
+    df['RV_REGIME'] = df['RV_10D'] / df['RV_60D']
+    df['RV_REGIME_Z60'] = calculate_zscore(df['RV_REGIME'], 60)
 
     # ==========================================
     # 5. VOLATILITY RISK PREMIUM (VRP) & TERM STRUCTURE
@@ -104,7 +108,7 @@ def calculate_indicators(df):
         # Scale VIX to a decimal
         vix_decimal = df['VIX'] / 100.0
 
-        # Calculate SPY RV using cleaner syntax
+        # Calculate SPY RV
         spy_log_ret = np.log(df['SPY']).diff()
         df['SPY_RV_20D'] = spy_log_ret.rolling(20).std() * np.sqrt(252)
 
@@ -189,6 +193,7 @@ def calculate_indicators(df):
         'VVIX', 'VVIX_CHG_1D', 'VVIX_Z60',
         'SKEW', 'SKEW_CHG_1D', 'SKEW_Z60',
         'RV_10D', 'RV_20D', 'RV_60D',
+        'RV_REGIME', 'RV_REGIME_Z60',  # <-- Added Vol Momentum Shift
         'SPY_RV_20D', 'MACRO_VRP_20D', 'MACRO_VRP_20D_Z60',
         'TSLA_MARKET_VOL_SPREAD_20D', 'TSLA_MARKET_VOL_SPREAD_20D_Z60',
         'VIX_TERM_RATIO', 'VIX_TERM_RATIO_Z60'
@@ -276,7 +281,7 @@ if __name__ == '__main__':
     final_df = calculate_indicators(full_df)
     final_df = final_df.dropna(subset=['Date']).sort_values('Date')
 
-    # 7. Strictly enforce the layout order (Original 55 + 6 New Vol Features)
+    # 7. Strictly enforce the layout order
     final_columns_order = [
         'Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'RSI', 'VWAP',
         'SMA_25', 'SMA_50', 'SMA_100', 'SMA_200',
@@ -293,6 +298,7 @@ if __name__ == '__main__':
         'VVIX', 'VVIX_CHG_1D', 'VVIX_Z60',
         'SKEW', 'SKEW_CHG_1D', 'SKEW_Z60',
         'RV_10D', 'RV_20D', 'RV_60D',
+        'RV_REGIME', 'RV_REGIME_Z60',  # <-- Added Vol Momentum Export
         'SPY_RV_20D', 'MACRO_VRP_20D', 'MACRO_VRP_20D_Z60',
         'TSLA_MARKET_VOL_SPREAD_20D', 'TSLA_MARKET_VOL_SPREAD_20D_Z60',
         'VIX_TERM_RATIO', 'VIX_TERM_RATIO_Z60'
