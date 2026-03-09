@@ -178,6 +178,7 @@ def build_surface_vectors(daily_path: str, options_path: str, surf_out_path: str
         iv90 = interpolate_linear(day_curve, 90, "atm_iv")
         vec["term_structure_30_90"] = iv30 - iv90
 
+        # These legacy maps are preserved so existing model logic isn't broken
         vix_val = vix_map.get(day_str, np.nan)
         spy_val = spy_map.get(day_str, np.nan)
         tsla_val = price_map.get(day_str, np.nan)
@@ -203,6 +204,21 @@ def build_surface_vectors(daily_path: str, options_path: str, surf_out_path: str
         df_out = df_out.fillna(0.0)
         df_out['iv_change_1d'] = 0.0
 
+    # =========================================================
+    # NEW MACRO MERGE: Additively attach all 61 daily features
+    # =========================================================
+    # Rename daily date column to match the surface trade_date
+    df_daily_features = df_daily.rename(columns={'date': 'trade_date'})
+    if 'date_str' in df_daily_features.columns:
+        df_daily_features = df_daily_features.drop(columns=['date_str'])
+
+    # Merge the massive macro dataset onto the options surface
+    df_out = pd.merge(df_out, df_daily_features, on='trade_date', how='left')
+
+    # Fill any weekend/holiday NaNs that might have slipped through
+    df_out = df_out.fillna(0.0)
+    # =========================================================
+
     df_out.to_csv(surf_out_path, index=False)
     print(f"SUCCESS. Saved Surface to: {surf_out_path}")
     print(f"SUCCESS. Saved Menu to:    {menu_out_path}")
@@ -211,7 +227,8 @@ def build_surface_vectors(daily_path: str, options_path: str, surf_out_path: str
 def main():
     ap = argparse.ArgumentParser()
     base_dir = r"C:\My Documents\Mics\Logs"
-    ap.add_argument("--daily", default=os.path.join(base_dir, "tsla_daily.csv"))
+    # --> UPDATED to point exactly to your new tft subdirectory path <--
+    ap.add_argument("--daily", default=r"C:\My Documents\Mics\Logs\tft\stock_daily.csv")
     ap.add_argument("--options", default=os.path.join(base_dir, "TSLA_Options_Chain_Historical_combined.csv"))
     ap.add_argument("--out-surface", default=os.path.join(base_dir, "TSLA_Surface_Vector_Merged.csv"))
     ap.add_argument("--out-menu", default=os.path.join(base_dir, "TSLA_Options_Contracts.csv"))
